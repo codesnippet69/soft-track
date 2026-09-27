@@ -8,6 +8,7 @@ import { notifications } from '@/i18n/en/settings/notifications'
 import { apiTokens } from '@/i18n/en/settings/apiTokens'
 import { connectedAccounts } from '@/i18n/en/settings/connectedAccounts'
 import { adminUsers } from '@/i18n/en/settings/adminUsers'
+import { departments } from '@/i18n/en/settings/departments'
 import { requireSiteAdmin } from '@/i18n/en/settings/requireSiteAdmin'
 import { roles } from '@/i18n/en/settings/roles'
 import { members } from '@/i18n/en/settings/members'
@@ -27,6 +28,7 @@ export const settings = {
   apiTokens,
   connectedAccounts,
   adminUsers,
+  departments,
   requireSiteAdmin,
   roles,
   members,
