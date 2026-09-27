@@ -1,4 +1,6 @@
 import type { NotificationKind, NotificationRead } from '@/api/generated/models'
+import { i18n } from '@/i18n'
+import { formatNumber } from '@/i18n/format'
 import type { IconName } from '@/ui/Icon'
 
 /**
@@ -9,39 +11,35 @@ import type { IconName } from '@/ui/Icon'
  * the rest of the interface's copy. The digest email has its own phrasing in
  * `lib_softtrack/digest.py` for the same reason: it is a different medium and
  * a different sentence ("assigned ENG-4 to you", not "assigned this to you").
+ *
+ * The sentences themselves are in the catalog (#106), `notifications:kinds`,
+ * each whole -- with the person in it, and without -- rather than a verb
+ * glued after a name.
  */
-export const KIND_META: Record<
-  NotificationKind,
-  { icon: IconName; verb: string; color: string }
-> = {
-  assigned: { icon: 'users', verb: 'assigned this to you', color: 'var(--color-accent-sky)' },
-  mentioned: { icon: 'sparkle', verb: 'mentioned you', color: 'var(--color-accent-pink)' },
-  commented: { icon: 'mail', verb: 'commented', color: 'var(--color-neutral-400)' },
-  status_changed: {
-    icon: 'board',
-    verb: 'changed the status',
-    color: 'var(--color-accent-amber)',
-  },
+export const KIND_META: Record<NotificationKind, { icon: IconName; color: string }> = {
+  assigned: { icon: 'users', color: 'var(--color-accent-sky)' },
+  mentioned: { icon: 'sparkle', color: 'var(--color-accent-pink)' },
+  commented: { icon: 'mail', color: 'var(--color-neutral-400)' },
+  status_changed: { icon: 'board', color: 'var(--color-accent-amber)' },
 }
 
-/** "Sam mentioned you" — the line above the issue title. */
+/** "Sam mentioned you" — the line above the ticket title. */
 export function describe(notification: NotificationRead): string {
   // Null actor is reserved for things no person did: a Jira import, and
   // whatever automation lands later. "Someone" is wrong for those, and the
   // bare verb reads correctly for all of them.
   const who = notification.actor?.full_name
-  const { verb } = KIND_META[notification.kind]
-  return who ? `${who} ${verb}` : verb.charAt(0).toUpperCase() + verb.slice(1)
-}
-
-/** The board route this notification points at. */
-export function issueHref(notification: NotificationRead): string {
-  return `/${notification.issue.team_key}/issue/${notification.issue.number}`
+  const kind = notification.kind
+  return who
+    ? i18n.t(`notifications:kinds.${kind}.byActor`, { actor: who })
+    : i18n.t(`notifications:kinds.${kind}.noActor`)
 }
 
 /** What the badge shows. Past 9 the exact number stops being actionable. */
 export function badgeLabel(unread: number): string {
-  return unread > 9 ? '9+' : String(unread)
+  return unread > 9
+    ? i18n.t('notifications:bell.badgeOverflow', { max: formatNumber(9) })
+    : formatNumber(unread)
 }
 
 /** Between a floating panel and the control it hangs from, and the viewport. */

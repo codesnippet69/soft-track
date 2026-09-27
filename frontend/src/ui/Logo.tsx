@@ -1,7 +1,9 @@
+import { useTranslation } from '@/i18n'
+
 /**
- * The SoftTrack mark: a routed path that reads as an "S" and as work moving
- * across a board. The tile carries the brand gradient with a glass highlight
- * so it belongs with the rest of the surfaces.
+ * The SoftTrack mark: three staggered board columns caught mid-wave, the
+ * active one brightest. The tile carries the brand gradient with a glass
+ * highlight so it belongs with the rest of the surfaces.
  *
  * `withWordmark` renders the full lockup. The mark alone is for tight spots
  * (favicon, collapsed sidebar); never re-typeset the wordmark by hand.
@@ -13,13 +15,14 @@ export function Logo({
   size?: number
   withWordmark?: boolean
 }) {
+  const { t } = useTranslation('ui')
   const mark = (
     <svg
       viewBox="0 0 32 32"
       width={size}
       height={size}
       role="img"
-      aria-label={withWordmark ? undefined : 'SoftTrack'}
+      aria-label={withWordmark ? undefined : t('logo.name')}
       aria-hidden={withWordmark || undefined}
       style={{ filter: 'drop-shadow(0 4px 10px color-mix(in oklab, var(--color-brand-600) 45%, transparent))' }}
     >
@@ -36,14 +39,9 @@ export function Logo({
       </defs>
       <rect width="32" height="32" rx="9" fill="url(#st-logo-fill)" />
       <rect width="32" height="32" rx="9" fill="url(#st-logo-sheen)" />
-      <path
-        d="M21.6 9.6h-7.2a3.4 3.4 0 0 0 0 6.8h3.2a3.4 3.4 0 0 1 0 6.8h-7.2"
-        fill="none"
-        stroke="#fff"
-        strokeWidth="3.2"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      />
+      <rect x="6.5" y="7" width="5" height="11" rx="2.5" fill="#fff" opacity="0.6" />
+      <rect x="13.5" y="12" width="5" height="13" rx="2.5" fill="#fff" />
+      <rect x="20.5" y="9" width="5" height="11" rx="2.5" fill="#fff" opacity="0.78" />
     </svg>
   )
 
@@ -56,7 +54,7 @@ export function Logo({
         className="font-semibold tracking-tight text-neutral-900"
         style={{ fontSize: size * 0.68 }}
       >
-        SoftTrack
+        {t('logo.name')}
       </span>
     </span>
   )

@@ -11,7 +11,7 @@ not on the list are refused outright rather than stored as
 
 **Deletion goes row first, bytes after the commit.** The two orders fail
 differently: a blob whose row is gone costs disk, while a row whose blob is
-gone costs a broken image on somebody's issue. Only one of those is worth
+gone costs a broken image on somebody's ticket. Only one of those is worth
 risking.
 """
 
@@ -21,14 +21,15 @@ from pathlib import PurePosixPath
 from typing import Optional
 from urllib.parse import quote
 
-from fastapi import HTTPException, UploadFile
+from fastapi import UploadFile
 from sqlmodel import Session, select
 
 from lib_identity.models.identity import UserPublic
-from lib_softtrack.models.attachments import AttachmentRead
+from lib_softtrack.models.attachments import AttachmentPreview, AttachmentRead
 from lib_softtrack.storage import ObjectNotFound, Storage
-from lib_softtrack.tables import Attachment, Comment, Issue, User
+from lib_softtrack.tables import Attachment, Comment, Ticket, User
 from lib_softtrack.teams import require_team_member
+from lib_utils.errors import ErrorCode, api_error
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +56,38 @@ ALLOWED_TYPES: dict[str, str] = {
     ".json": "application/json",
     ".patch": "text/plain",
     ".diff": "text/plain",
+    # Source and config files (#101), stored and served as plain text -- the
+    # one type a browser will never execute or render as markup. `.html`,
+    # `.svg` and `.xml` stay out: plain text is the only way they could be
+    # served safely, and then a preview is not what anybody uploaded them for.
+    **{
+        extension: "text/plain"
+        for extension in (
+            ".py",
+            ".js",
+            ".jsx",
+            ".ts",
+            ".tsx",
+            ".go",
+            ".rs",
+            ".java",
+            ".kt",
+            ".rb",
+            ".php",
+            ".c",
+            ".h",
+            ".cpp",
+            ".cs",
+            ".swift",
+            ".sql",
+            ".css",
+            ".yaml",
+            ".yml",
+            ".toml",
+            ".ini",
+            ".cfg",
+        )
+    },
     ".zip": "application/zip",
     ".mp4": "video/mp4",
     ".webm": "video/webm",
@@ -64,6 +97,14 @@ ALLOWED_TYPES: dict[str, str] = {
 #: The types rendered inline rather than downloaded. Every one is an image
 #: format a browser decodes as an image and nothing else.
 IMAGE_TYPES = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
+
+#: Types previewed as text (#101). Every one of them is *served* as
+#: `text/plain` whatever it is stored as -- see `served_type`.
+TEXT_TYPES = frozenset({"text/plain", "text/markdown", "text/csv", "application/json"})
+
+#: What a text preview is served as: plain, UTF-8, and never anything a
+#: browser renders as markup.
+PLAIN_TEXT = "text/plain; charset=utf-8"
 
 #: First bytes each image format must start with. Checked because "screenshot
 #: of the bug" is the whole point of this feature and a file that is not
@@ -76,6 +117,10 @@ _IMAGE_SIGNATURES: dict[str, tuple[bytes, ...]] = {
     "image/gif": (b"GIF87a", b"GIF89a"),
     "image/webp": (b"RIFF",),
 }
+
+#: Where a PDF's header may sit. The format allows junk before it and readers
+#: tolerate up to a kilobyte of it, so the check does too.
+_PDF_HEADER_WINDOW = 1024
 
 #: Long enough that a name is still recognisable, short enough that it cannot
 #: be used to bloat a row or a response header.
@@ -119,14 +164,38 @@ def _storage_key(extension: str) -> str:
     return f"{token[:2]}/{token}{extension}"
 
 
+def preview_kind(content_type: str) -> Optional[AttachmentPreview]:
+    """How the client may show this file without downloading it, if at all."""
+    if content_type in IMAGE_TYPES:
+        return AttachmentPreview.image
+    if content_type == "application/pdf":
+        return AttachmentPreview.pdf
+    if content_type in TEXT_TYPES:
+        return AttachmentPreview.text
+    return None
+
+
+def served_type(attachment: Attachment) -> str:
+    """The Content-Type the bytes go out with.
+
+    The stored type for everything except text, which always goes out as
+    `text/plain; charset=utf-8`. A Markdown or JSON file served as itself is
+    something a browser may decide to render; plain text is the one type it
+    only ever displays. The filename still says what the file is.
+    """
+    if preview_kind(attachment.content_type) == AttachmentPreview.text:
+        return PLAIN_TEXT
+    return attachment.content_type
+
+
 def content_disposition(attachment: Attachment) -> str:
-    """`inline` for images, `attachment` for everything else.
+    """`inline` for what can be previewed, `attachment` for everything else.
 
     Both spellings of the filename are sent: the bare `filename=` for clients
     that predate RFC 5987 and `filename*=` for every name that is not ASCII,
     which is most people's names for most files.
     """
-    disposition = "inline" if attachment.content_type in IMAGE_TYPES else "attachment"
+    disposition = "inline" if preview_kind(attachment.content_type) else "attachment"
     name = attachment.filename
     ascii_name = name.encode("ascii", "replace").decode("ascii").replace('"', "'")
     return (
@@ -138,12 +207,13 @@ def content_disposition(attachment: Attachment) -> str:
 def to_read(attachment: Attachment, uploader: User) -> AttachmentRead:
     return AttachmentRead(
         id=attachment.id,
-        issue_id=attachment.issue_id,
+        ticket_id=attachment.ticket_id,
         comment_id=attachment.comment_id,
         filename=attachment.filename,
         content_type=attachment.content_type,
         size_bytes=attachment.size_bytes,
         is_image=attachment.content_type in IMAGE_TYPES,
+        preview=preview_kind(attachment.content_type),
         url=f"/attachments/{attachment.id}/content",
         uploaded_by=UserPublic.model_validate(uploader),
         created_at=attachment.created_at,
@@ -162,11 +232,13 @@ def _expand(session: Session, attachments: list[Attachment]) -> list[AttachmentR
     return [to_read(a, uploaders[a.uploaded_by_id]) for a in attachments]
 
 
-def _issue_or_404(session: Session, issue_id: int) -> Issue:
-    issue = session.get(Issue, issue_id)
-    if issue is None:
-        raise HTTPException(status_code=404, detail="Issue not found")
-    return issue
+def _ticket_or_404(session: Session, ticket_id: int) -> Ticket:
+    ticket = session.get(Ticket, ticket_id)
+    if ticket is None:
+        raise api_error(
+            status_code=404, code=ErrorCode.ticket_not_found, detail="Ticket not found"
+        )
+    return ticket
 
 
 def get_attachment_for_read(
@@ -174,14 +246,18 @@ def get_attachment_for_read(
 ) -> Attachment:
     """An attachment the caller is allowed to see, or 404/403.
 
-    The issue is the only route to a team, which is why every attachment has
+    The ticket is the only route to a team, which is why every attachment has
     one even when a comment owns it.
     """
     attachment = session.get(Attachment, attachment_id)
     if attachment is None:
-        raise HTTPException(status_code=404, detail="Attachment not found")
-    issue = _issue_or_404(session, attachment.issue_id)
-    require_team_member(issue.team_id, current_user, session)
+        raise api_error(
+            status_code=404,
+            code=ErrorCode.attachment_not_found,
+            detail="Attachment not found",
+        )
+    ticket = _ticket_or_404(session, attachment.ticket_id)
+    require_team_member(ticket.team_id, current_user, session)
     return attachment
 
 
@@ -189,27 +265,32 @@ def create_attachment(
     session: Session,
     storage: Storage,
     current_user: User,
-    issue_id: int,
+    ticket_id: int,
     upload: UploadFile,
     data: bytes,
 ) -> AttachmentRead:
-    """Store an uploaded file against an issue.
+    """Store an uploaded file against a ticket.
 
     `data` is read by the router, which is where the size limit is enforced --
     a limit is only worth anything if it is applied before the whole body is
     in hand.
     """
-    issue = _issue_or_404(session, issue_id)
-    require_team_member(issue.team_id, current_user, session)
+    ticket = _ticket_or_404(session, ticket_id)
+    require_team_member(ticket.team_id, current_user, session)
 
     filename = safe_filename(upload.filename or "")
     if not filename:
-        raise HTTPException(status_code=422, detail="That file has no usable name.")
+        raise api_error(
+            status_code=422,
+            code=ErrorCode.attachment_name_missing,
+            detail="That file has no usable name.",
+        )
 
     content_type = content_type_for(filename)
     if content_type is None:
-        raise HTTPException(
+        raise api_error(
             status_code=415,
+            code=ErrorCode.attachment_type_not_allowed,
             detail=(
                 f"{PurePosixPath(filename).suffix or 'That file type'} is not an "
                 "accepted attachment type. Accepted: "
@@ -219,12 +300,18 @@ def create_attachment(
         )
 
     if not data:
-        raise HTTPException(status_code=422, detail="That file is empty.")
+        raise api_error(
+            status_code=422, code=ErrorCode.file_empty, detail="That file is empty."
+        )
 
     signatures = _IMAGE_SIGNATURES.get(content_type)
-    if signatures and not data.startswith(signatures):
-        raise HTTPException(
+    not_a_pdf = (
+        content_type == "application/pdf" and b"%PDF-" not in data[:_PDF_HEADER_WINDOW]
+    )
+    if (signatures and not data.startswith(signatures)) or not_a_pdf:
+        raise api_error(
             status_code=422,
+            code=ErrorCode.attachment_content_mismatch,
             detail=f"{filename} is not a valid {content_type.split('/')[1].upper()}.",
         )
 
@@ -234,7 +321,7 @@ def create_attachment(
     storage.write(key, data)
 
     attachment = Attachment(
-        issue_id=issue_id,
+        ticket_id=ticket_id,
         filename=filename,
         content_type=content_type,
         size_bytes=len(data),
@@ -253,20 +340,20 @@ def create_attachment(
     return to_read(attachment, current_user)
 
 
-def list_for_issue(
-    session: Session, current_user: User, issue_id: int
+def list_for_ticket(
+    session: Session, current_user: User, ticket_id: int
 ) -> list[AttachmentRead]:
-    """The issue's own files -- the ones no comment has claimed.
+    """The ticket's own files -- the ones no comment has claimed.
 
     Comment attachments come back on the comment, so each file has exactly one
     place it is listed and the UI never has to dedupe.
     """
-    issue = _issue_or_404(session, issue_id)
-    require_team_member(issue.team_id, current_user, session)
+    ticket = _ticket_or_404(session, ticket_id)
+    require_team_member(ticket.team_id, current_user, session)
 
     attachments = session.exec(
         select(Attachment)
-        .where(Attachment.issue_id == issue_id, Attachment.comment_id.is_(None))
+        .where(Attachment.ticket_id == ticket_id, Attachment.comment_id.is_(None))
         .order_by(Attachment.created_at, Attachment.id)
     ).all()
     return _expand(session, list(attachments))
@@ -295,8 +382,8 @@ def claim_for_comment(
 ) -> None:
     """Hand a comment the files that were uploaded while it was being written.
 
-    Only unclaimed attachments on the same issue can be claimed, so a comment
-    cannot adopt a file out of someone else's comment or off another issue and
+    Only unclaimed attachments on the same ticket can be claimed, so a comment
+    cannot adopt a file out of someone else's comment or off another ticket and
     thereby carry it somewhere the uploader never put it.
     """
     if not attachment_ids:
@@ -312,11 +399,12 @@ def claim_for_comment(
         attachment = found.get(attachment_id)
         if (
             attachment is None
-            or attachment.issue_id != comment.issue_id
+            or attachment.ticket_id != comment.ticket_id
             or attachment.comment_id is not None
         ):
-            raise HTTPException(
+            raise api_error(
                 status_code=400,
+                code=ErrorCode.attachment_not_attachable,
                 detail=f"Attachment {attachment_id} cannot be attached to this comment.",
             )
         attachment.comment_id = comment.id
@@ -333,15 +421,30 @@ def delete_attachment(
     purge(storage, [key])
 
 
-def take_keys_for_issue(session: Session, issue_id: int) -> list[str]:
-    """Delete an issue's attachment rows, returning the keys still to purge.
+def take_keys_for_ticket(session: Session, ticket_id: int) -> list[str]:
+    """Delete a ticket's attachment rows, returning the keys still to purge.
 
-    Called while deleting an issue. The rows go now, inside the caller's
+    Called while deleting a ticket. The rows go now, inside the caller's
     transaction; the bytes go after it commits, which is why the keys come
     back rather than being deleted here.
     """
     attachments = session.exec(
-        select(Attachment).where(Attachment.issue_id == issue_id)
+        select(Attachment).where(Attachment.ticket_id == ticket_id)
+    ).all()
+    keys = [attachment.storage_key for attachment in attachments]
+    for attachment in attachments:
+        session.delete(attachment)
+    return keys
+
+
+def take_keys_for_comment(session: Session, comment_id: int) -> list[str]:
+    """Delete a comment's attachment rows, returning the keys still to purge.
+
+    Called while deleting a comment (#93), for the reasons and in the order
+    `take_keys_for_ticket` gives: rows now, bytes after the commit.
+    """
+    attachments = session.exec(
+        select(Attachment).where(Attachment.comment_id == comment_id)
     ).all()
     keys = [attachment.storage_key for attachment in attachments]
     for attachment in attachments:

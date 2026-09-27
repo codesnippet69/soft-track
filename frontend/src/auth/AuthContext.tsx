@@ -1,50 +1,16 @@
-import {
-  createContext,
-  useContext,
-  useMemo,
-  useState,
-  type ReactNode,
-} from 'react'
+import { useMemo, useState, type ReactNode } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 
-import { AUTH_TOKEN_STORAGE_KEY, AXIOS_INSTANCE } from '@/api/client'
+import { AUTH_TOKEN_STORAGE_KEY } from '@/api/client'
 import {
   getMeAuthMeGetQueryKey,
-  useRegisterAuthRegisterPost,
+  useLoginAuthLoginPost,
   useMeAuthMeGet,
+  useRegisterAuthRegisterPost,
+  useTotpVerifyAuthTotpVerifyPost,
 } from '@/api/generated/endpoints/auth/auth'
 import type { UserMe } from '@/api/generated/models'
-
-export interface TotpPending {
-  pending_token: string
-  totp_required: true
-}
-
-interface AuthContextValue {
-  user: UserMe | null
-  isLoading: boolean
-  isAuthenticated: boolean
-  login: (email: string, password: string) => Promise<TotpPending | null>
-  totpVerify: (pendingToken: string, code: string) => Promise<void>
-  register: (
-    email: string,
-    password: string,
-    fullName: string,
-    options?: { username?: string; inviteToken?: string },
-  ) => Promise<void>
-  /**
-   * Adopt a token the API just handed back.
-   *
-   * Changing a password or signing out everywhere invalidates every token
-   * including the one in this tab, and the endpoints return a fresh one so the
-   * person who just secured their account is not thrown out of it. Exposed
-   * rather than private because the settings pages are where that happens.
-   */
-  setSession: (token: string, user: UserMe) => void
-  logout: () => void
-}
-
-const AuthContext = createContext<AuthContextValue | undefined>(undefined)
+import { AuthContext, isTotpPending, type AuthContextValue } from '@/auth/useAuth'
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [token, setToken] = useState<string | null>(() =>
@@ -56,7 +22,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     query: { enabled: Boolean(token), retry: false },
   })
 
+  const loginMutation = useLoginAuthLoginPost()
   const registerMutation = useRegisterAuthRegisterPost()
+  const totpVerifyMutation = useTotpVerifyAuthTotpVerifyPost()
 
   const setSession = (newToken: string, user: UserMe) => {
     localStorage.setItem(AUTH_TOKEN_STORAGE_KEY, newToken)
@@ -64,31 +32,28 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     queryClient.setQueryData(getMeAuthMeGetQueryKey(), user)
   }
 
-  const login = async (email: string, password: string): Promise<TotpPending | null> => {
-    const form = new URLSearchParams()
-    form.append('username', email)
-    form.append('password', password)
-    const response = await AXIOS_INSTANCE.post('/auth/login', form, {
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      validateStatus: (s) => s < 400,
+  const adoptSession = (newToken: string, user: UserMe) => {
+    queryClient.clear()
+    setSession(newToken, user)
+  }
+
+  const login = async (email: string, password: string) => {
+    const result = await loginMutation.mutateAsync({
+      data: { username: email, password },
     })
-
-    if (response.status === 202) {
-      return response.data as TotpPending
-    }
-
-    const { access_token, user } = response.data
-    setSession(access_token, user)
+    // A 202: the password was right, and the account wants its code too.
+    if (isTotpPending(result)) return result
+    setSession(result.access_token, result.user)
     return null
   }
 
-  const totpVerify = async (pendingToken: string, code: string): Promise<void> => {
-    const response = await AXIOS_INSTANCE.post('/auth/totp/verify', {
-      pending_token: pendingToken,
-      code,
+  const totpVerify = async (pendingToken: string, code: string) => {
+    const result = await totpVerifyMutation.mutateAsync({
+      data: { pending_token: pendingToken, code },
     })
-    const { access_token, user } = response.data
-    setSession(access_token, user)
+    // Adopted rather than set: the first factor may have been Google or
+    // GitHub, and whoever arrives is not necessarily who was here before.
+    adoptSession(result.access_token, result.user)
   }
 
   const register = async (
@@ -124,6 +89,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       totpVerify,
       register,
       setSession,
+      adoptSession,
       logout,
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -133,8 +99,3 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>
 }
 
-export function useAuth(): AuthContextValue {
-  const ctx = useContext(AuthContext)
-  if (!ctx) throw new Error('useAuth must be used within an AuthProvider')
-  return ctx
-}

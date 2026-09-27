@@ -1,7 +1,7 @@
-from datetime import datetime
+from datetime import date, datetime
 from typing import Literal, Optional
 
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
 
 class UserCreate(BaseModel):
@@ -30,8 +30,7 @@ class UserPublic(BaseModel):
     #: people out of assignee pickers without hiding work already assigned.
     is_active: bool
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class UserMe(UserPublic):
@@ -43,8 +42,25 @@ class UserMe(UserPublic):
     """
 
     is_site_admin: bool
+    #: False for an account created by signing in with Google or GitHub and
+    #: never given one. What the Security page reads to offer "Set a password"
+    #: instead of "Change password", and what stops the app asking for a
+    #: password that does not exist.
+    has_password: bool
     created_at: datetime
+    #: Whether signing in also asks for a code from an authenticator app.
     totp_enabled: bool
+    #: What the organisation knows about them (#122). Null until somebody
+    #: fills it in. Title and location are theirs to edit; the start date is
+    #: set by a site admin.
+    job_title: Optional[str] = None
+    location: Optional[str] = None
+    started_on: Optional[date] = None
+
+
+#: Long enough for "Senior Staff Site Reliability Engineer, Payments" and a
+#: city with its country; short enough to fit a directory row.
+PROFILE_TEXT_MAX = 100
 
 
 class UserUpdate(BaseModel):
@@ -52,14 +68,33 @@ class UserUpdate(BaseModel):
     username: Optional[str] = None
     avatar_color: Optional[str] = None
     email: Optional[EmailStr] = None
-    #: Required only when `email` changes. An address is the identity a
-    #: password reset would one day be sent to, so changing it is re-verified
-    #: even though the session is already authenticated.
+    #: Blank or null clears it. Only the person edits these two; there is no
+    #: admin route to them, because a title and a location are theirs to say.
+    job_title: Optional[str] = Field(default=None, max_length=PROFILE_TEXT_MAX)
+    location: Optional[str] = Field(default=None, max_length=PROFILE_TEXT_MAX)
+    #: Required only when `email` changes, and only for an account that has a
+    #: password. An address is the identity a password reset would one day be
+    #: sent to, so changing it is re-verified even though the session is
+    #: already authenticated.
     current_password: Optional[str] = None
 
 
 class PasswordChange(BaseModel):
-    current_password: str
+    #: Optional only for an account that has no password yet -- one created by
+    #: signing in with a provider. Anywhere else an absent value simply fails
+    #: the check, the same way a wrong one does.
+    current_password: Optional[str] = None
+    new_password: str = Field(min_length=8)
+
+
+class ForgotPassword(BaseModel):
+    email: EmailStr
+
+
+class ResetPassword(BaseModel):
+    """The token from a reset link, and the password to set with it."""
+
+    token: str = Field(min_length=1)
     new_password: str = Field(min_length=8)
 
 
@@ -73,6 +108,14 @@ class AuthConfig(BaseModel):
     #: Whether this instance is seeded with the published demo account, and so
     #: may prefill its address and print its password under the sign-in button.
     demo_credentials: bool
+    #: The providers this instance can sign somebody in with, in the order the
+    #: buttons should appear. Empty on an install that has configured neither,
+    #: which is the default and keeps SoftTrack dependency-free.
+    oauth_providers: list[str]
+    #: Whether "Forgot password?" is offered (#83). Only when this instance
+    #: can send mail -- a link to a form whose email never arrives is worse
+    #: than no link.
+    password_reset: bool
 
 
 class Token(BaseModel):
@@ -82,30 +125,35 @@ class Token(BaseModel):
 
 
 class TotpLoginPending(BaseModel):
+    """A first factor that passed, for an account with two-factor on."""
+
+    #: Redeem with a code at /auth/totp/verify. Lives five minutes, and is no
+    #: use as a bearer token.
     pending_token: str
     totp_required: Literal[True] = True
 
 
 class TotpVerifyRequest(BaseModel):
     pending_token: str
-    code: str
+    #: Six digits from the authenticator, or one of the recovery codes.
+    code: str = Field(max_length=64)
 
 
 class TotpEnrolmentStart(BaseModel):
+    #: The `otpauth://` URI, for a QR code.
     provisioning_uri: str
+    #: The same secret in Base32, for typing in by hand.
     manual_key: str
 
 
-class TotpEnrolmentConfirm(BaseModel):
-    code: str
+class TotpCode(BaseModel):
+    """A code from the authenticator -- or, to turn it off, a recovery code."""
+
+    code: str = Field(max_length=64)
 
 
 class TotpEnrolmentResult(BaseModel):
+    #: Shown once and never again; only their hashes are stored.
     recovery_codes: list[str]
+    #: Every session was signed out, this one included. This keeps it going.
     token: Token
-
-
-class TotpDisable(BaseModel):
-    code: str
-
-

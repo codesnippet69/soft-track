@@ -1,15 +1,15 @@
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from lib_softtrack.tables import StatusCategory
 
 
 class StatusRead(BaseModel):
-    """A team's status, as everything that renders an issue receives it.
+    """A team's status, as everything that renders a ticket receives it.
 
-    Embedded in IssueRead rather than referenced by id: a search hit and a
-    linked issue are both drawn outside any team's board, where there is no
+    Embedded in TicketRead rather than referenced by id: a search hit and a
+    linked ticket are both drawn outside any team's board, where there is no
     status list on hand to look the id up in.
     """
 
@@ -20,8 +20,7 @@ class StatusRead(BaseModel):
     position: int
     color: str
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class StatusCreate(BaseModel):
@@ -49,9 +48,9 @@ class StatusOrder(BaseModel):
 
 
 class StatusDelete(BaseModel):
-    """Where the issues in the status being deleted should go.
+    """Where the tickets in the status being deleted should go.
 
-    Required rather than defaulted. Issues are the point of the tracker, and
+    Required rather than defaulted. Tickets are the point of the tracker, and
     guessing which column somebody's work should land in is not a decision to
     make on their behalf.
     """

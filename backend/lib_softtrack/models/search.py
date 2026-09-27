@@ -3,7 +3,7 @@ from datetime import datetime
 from pydantic import BaseModel
 
 from lib_softtrack.models.statuses import StatusRead
-from lib_softtrack.tables import IssuePriority
+from lib_softtrack.tables import TicketPriority
 
 
 class SearchHit(BaseModel):
@@ -11,8 +11,10 @@ class SearchHit(BaseModel):
     identifier: str
     title: str
     status: StatusRead
-    priority: IssuePriority
+    priority: TicketPriority
     team_id: int
+    team_key: str
+    number: int
     updated_at: datetime
     #: Where the match was found: "title", "description" or "comment". Shown
     #: next to the result so a hit with no visible match in the title does not

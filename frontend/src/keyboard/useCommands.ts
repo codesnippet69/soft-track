@@ -2,18 +2,21 @@ import { useMemo } from 'react'
 import { useNavigate } from 'react-router-dom'
 
 import type { TeamRead, UserMe } from '@/api/generated/models'
+import { useTranslation } from '@/i18n'
 import type { Command } from '@/keyboard/CommandPalette'
 
-export type BoardView = 'board' | 'list' | 'reports'
+export const BOARD_VIEWS = ['board', 'list', 'calendar', 'roadmap', 'reports'] as const
+export type BoardView = (typeof BOARD_VIEWS)[number]
 
-/** What the command palette can do from the board, beyond jumping to issues. */
+/** What the command palette can do from the board, beyond jumping to tickets. */
 export function useCommands({
   view,
   setView,
   team,
   teams,
   user,
-  openNewIssue,
+  openNewTicket,
+  openNewProject,
   openShortcuts,
 }: {
   view: BoardView
@@ -21,25 +24,51 @@ export function useCommands({
   team: TeamRead | undefined
   teams: TeamRead[]
   user: UserMe | null
-  openNewIssue: () => void
+  /** Absent for a guest (#104), who has nothing to create. */
+  openNewTicket?: () => void
+  /** Absent for a guest, the same way. */
+  openNewProject?: () => void
   openShortcuts: () => void
 }): Command[] {
   const navigate = useNavigate()
+  const { t } = useTranslation('keyboard')
 
   return useMemo(() => {
+    const actions = t('commands.groups.actions')
+    const account = t('commands.groups.account')
     const list: Command[] = [
-      { id: 'new-issue', label: 'Create an issue', hint: 'C', group: 'Actions', run: openNewIssue },
+      ...(openNewTicket
+        ? [
+            {
+              id: 'new-ticket',
+              label: t('commands.newTicket'),
+              hint: 'C',
+              group: actions,
+              run: openNewTicket,
+            },
+          ]
+        : []),
+      ...(openNewProject
+        ? [
+            {
+              id: 'new-project',
+              label: t('commands.newProject'),
+              group: actions,
+              run: openNewProject,
+            },
+          ]
+        : []),
       {
         id: 'toggle-view',
-        label: view === 'board' ? 'Switch to list view' : 'Switch to board view',
-        group: 'Actions',
+        label: view === 'board' ? t('commands.switchToList') : t('commands.switchToBoard'),
+        group: actions,
         run: () => setView(view === 'board' ? 'list' : 'board'),
       },
       {
         id: 'shortcuts',
-        label: 'Show keyboard shortcuts',
+        label: t('commands.showShortcuts'),
         hint: '?',
-        group: 'Actions',
+        group: actions,
         run: openShortcuts,
       },
     ]
@@ -48,33 +77,33 @@ export function useCommands({
       if (candidate.id === team?.id) continue
       list.push({
         id: `team-${candidate.id}`,
-        label: `Switch to ${candidate.name}`,
+        label: t('commands.switchTeam', { team: candidate.name }),
         hint: candidate.key,
-        group: 'Teams',
+        group: t('commands.groups.teams'),
         run: () => navigate(`/${candidate.key}`),
       })
     }
 
     list.push({
       id: 'settings',
-      label: 'Open settings',
-      group: 'Account',
+      label: t('commands.openSettings'),
+      group: account,
       run: () => navigate('/settings/profile'),
     })
     if (team) {
       list.push({
         id: 'team-members',
-        label: 'Manage team members',
+        label: t('commands.manageMembers'),
         hint: team.key,
-        group: 'Account',
+        group: account,
         run: () => navigate(`/settings/teams/${team.key}/members`),
       })
     }
     if (user?.is_site_admin) {
       list.push({
         id: 'site-admin',
-        label: 'Site administration',
-        group: 'Account',
+        label: t('commands.siteAdmin'),
+        group: account,
         run: () => navigate('/settings/admin/users'),
       })
     }
@@ -87,7 +116,9 @@ export function useCommands({
     team,
     user?.is_site_admin,
     navigate,
-    openNewIssue,
+    openNewTicket,
+    openNewProject,
     openShortcuts,
+    t,
   ])
 }

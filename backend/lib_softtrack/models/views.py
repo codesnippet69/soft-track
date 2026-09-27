@@ -4,28 +4,39 @@ from typing import Optional
 from pydantic import BaseModel, Field, model_validator
 
 from lib_identity.models.identity import UserPublic
-from lib_softtrack.tables import IssuePriority
+from lib_softtrack.tables import (
+    DueFilter,
+    TicketGrouping,
+    TicketPriority,
+    TicketSort,
+    TicketType,
+    SortDirection,
+)
 
 
 class ViewFilters(BaseModel):
-    """What a view narrows the issue list to.
+    """What a view narrows the ticket list to.
 
     Nested rather than flattened into the view models so that the same shape
     is what the board sends, what a view stores, and what the frontend keeps
     in the URL -- one type to keep in step instead of three.
 
-    Null everywhere means "all issues", which is what an empty view is.
+    Null everywhere means "all tickets", which is what an empty view is.
     """
 
     status_id: Optional[int] = None
-    priority: Optional[IssuePriority] = None
+    priority: Optional[TicketPriority] = None
     assignee_id: Optional[int] = None
     #: "Nobody is assigned", which `assignee_id = null` does not say -- that
     #: means "anybody".
     unassigned: bool = False
     label_id: Optional[int] = None
     project_id: Optional[int] = None
-    cycle_id: Optional[int] = None
+    sprint_id: Optional[int] = None
+    #: Overdue, due this week, or no due date (#87). Measured from the
+    #: viewer's own today when the view is applied, not from when it was saved.
+    due: Optional[DueFilter] = None
+    type: Optional[TicketType] = None
 
     @model_validator(mode="after")
     def _one_assignee_question_at_a_time(self) -> "ViewFilters":
@@ -40,6 +51,13 @@ class SavedViewCreate(BaseModel):
     name: str = Field(min_length=1, max_length=60)
     is_shared: bool = False
     filters: ViewFilters = ViewFilters()
+    #: Beside the filters rather than inside them: a filter narrows the list
+    #: and a grouping only arranges it, and `ViewFilters` is also the shape
+    #: of the board's ticket query, which has no use for a grouping.
+    group_by: TicketGrouping = TicketGrouping.status
+    #: How the list is ordered (#88). Null is the default: newest first.
+    sort: Optional[TicketSort] = None
+    sort_direction: Optional[SortDirection] = None
 
 
 class SavedViewUpdate(BaseModel):
@@ -49,6 +67,9 @@ class SavedViewUpdate(BaseModel):
     name: Optional[str] = Field(default=None, min_length=1, max_length=60)
     is_shared: Optional[bool] = None
     filters: Optional[ViewFilters] = None
+    group_by: Optional[TicketGrouping] = None
+    sort: Optional[TicketSort] = None
+    sort_direction: Optional[SortDirection] = None
 
 
 class SavedViewRead(BaseModel):
@@ -58,6 +79,9 @@ class SavedViewRead(BaseModel):
     owner: UserPublic
     is_shared: bool
     filters: ViewFilters
+    group_by: TicketGrouping
+    sort: Optional[TicketSort] = None
+    sort_direction: Optional[SortDirection] = None
     created_at: datetime
     updated_at: datetime
 

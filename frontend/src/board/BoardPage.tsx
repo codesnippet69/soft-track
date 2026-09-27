@@ -1,10 +1,14 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Navigate, useNavigate, useParams, useSearchParams } from 'react-router-dom'
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react'
+import { Navigate, useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 
-import { useListIssuesTeamsTeamIdIssuesGet } from '@/api/generated/endpoints/issues/issues'
+import {
+  useGetTicketByNumberTeamsTeamIdTicketsByNumberNumberGet,
+  useListTicketsTeamsTeamIdTicketsGet,
+} from '@/api/generated/endpoints/tickets/tickets'
 import { useSearchSearchGet } from '@/api/generated/endpoints/search/search'
-import type { IssueRead, SavedViewRead } from '@/api/generated/models'
-import { useAuth } from '@/auth/AuthContext'
+import type { SavedViewRead } from '@/api/generated/models'
+import { useAuth } from '@/auth/useAuth'
+import { BulkActionBar } from '@/board/BulkActionBar'
 import {
   type BoardFilters,
   fromSearchParams,
@@ -13,24 +17,48 @@ import {
   toQueryParams,
   toSearchParams,
 } from '@/board/filters'
-import { IssueListView } from '@/board/IssueListView'
+import { type BoardGrouping, groupingFromSearchParams, withGrouping } from '@/board/grouping'
+import {
+  type Arrangement,
+  type BoardSort,
+  fromViewSort,
+  sameSort,
+  sortFromSearchParams,
+  withSort,
+} from '@/board/sorting'
+import { TicketListView } from '@/board/TicketListView'
+import { TicketPeekLayer } from '@/board/TicketPeek'
+import { PeekContext } from '@/board/peekContext'
 import { KanbanBoard } from '@/board/KanbanBoard'
+import { EMPTY_SELECTION, selectionReducer } from '@/board/selection'
 import { Sidebar } from '@/board/Sidebar'
 import { TopBar } from '@/board/TopBar'
+import { useBulkEdit } from '@/board/useBulkEdit'
 import { useOverlays } from '@/board/useOverlays'
+import { usePeek } from '@/board/usePeek'
+import { useMoveTicket } from '@/board/useMoveTicket'
 import { useStatusChange } from '@/board/useStatusChange'
-import { CycleBanner } from '@/cycles/CycleBanner'
-import { NewCycleModal } from '@/cycles/NewCycleModal'
+import { CalendarView } from '@/calendar/CalendarView'
+import { SprintBanner } from '@/sprints/SprintBanner'
+import { NewSprintModal } from '@/sprints/NewSprintModal'
+import { useTranslation } from '@/i18n'
 import { ImportJiraModal } from '@/imports/ImportJiraModal'
-import { IssueDetailPanel } from '@/issues/IssueDetailPanel'
-import { NewIssueModal } from '@/issues/NewIssueModal'
+import { TicketDetailPanel } from '@/tickets/TicketDetailPanel'
+import { type TicketRef, useOpenTicket } from '@/tickets/surface'
+import { NewTicketModal } from '@/tickets/NewTicketModal'
 import { CommandPalette } from '@/keyboard/CommandPalette'
 import { ShortcutsCheatsheet } from '@/keyboard/ShortcutsCheatsheet'
-import { type BoardView, useCommands } from '@/keyboard/useCommands'
+import { BOARD_VIEWS, type BoardView, useCommands } from '@/keyboard/useCommands'
 import { useGlobalShortcuts } from '@/keyboard/useGlobalShortcuts'
+import { isTypingTarget } from '@/keyboard/typing'
+import { NewProjectModal } from '@/projects/NewProjectModal'
+import { ProjectPage } from '@/projects/ProjectPage'
+import { RoadmapView } from '@/projects/RoadmapView'
+import { useTeamEvents } from '@/realtime/useTeamEvents'
 import { ReportsView } from '@/reports/ReportsView'
 import { SearchResults } from '@/search/SearchResults'
 import { useDebounced } from '@/search/useDebounced'
+import { canWriteIn } from '@/team/members'
 import { TeamProvider } from '@/team/TeamContext'
 import { useTeamData } from '@/team/useTeamData'
 import { useTeamByKey } from '@/team/useTeams'
@@ -38,14 +66,44 @@ import { Loading } from '@/ui/Loading'
 import { SaveViewModal } from '@/views/SaveViewModal'
 import { useSavedViews } from '@/views/useSavedViews'
 
+/**
+ * What the board looked like when it was left for a ticket's page (#112).
+ *
+ * The view and the search are this page's own state rather than its URL, and
+ * the page is unmounted while a ticket's page stands in for it. So on the way
+ * out they are written onto this history entry, and Back reads them from
+ * there: you return to the list you were on, with your search still in it.
+ */
+type BoardReturn = { view: BoardView; search: string }
+
+function boardReturnFrom(state: unknown): BoardReturn | null {
+  const saved = (state as { board?: { view?: unknown; search?: unknown } } | null)?.board
+  if (!saved) return null
+  return {
+    view: BOARD_VIEWS.find((view) => view === saved.view) ?? 'board',
+    search: typeof saved.search === 'string' ? saved.search : '',
+  }
+}
+
 export default function BoardPage() {
-  const { teamKey, issueNumber } = useParams<{ teamKey: string; issueNumber?: string }>()
+  const { teamKey, ticketNumber, projectId } = useParams<{
+    teamKey: string
+    ticketNumber?: string
+    projectId?: string
+  }>()
+  // A project's own page, in place of the board -- same sidebar, same team.
+  const projectPageId = projectId && Number.isInteger(Number(projectId)) ? Number(projectId) : null
   const navigate = useNavigate()
+  const location = useLocation()
+  const goToTicket = useOpenTicket()
   const { team, isLoading, teams } = useTeamByKey(teamKey)
   const { user } = useAuth()
+  const { t } = useTranslation(['board', 'common'])
 
-  const [view, setView] = useState<BoardView>('board')
-  const [search, setSearch] = useState('')
+  // Read once, on mount: Back from a ticket's page lands here.
+  const [returning] = useState(() => boardReturnFrom(location.state))
+  const [view, setView] = useState<BoardView>(returning?.view ?? 'board')
+  const [search, setSearch] = useState(returning?.search ?? '')
   // The sidebar is a drawer below the `lg` breakpoint.
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const overlays = useOverlays()
@@ -56,12 +114,45 @@ export default function BoardPage() {
   // back and forward buttons for free.
   const [searchParams, setSearchParams] = useSearchParams()
   const filters = useMemo(() => fromSearchParams(searchParams), [searchParams])
-  const setFilters = useCallback(
-    (next: BoardFilters) => setSearchParams(toSearchParams(next)),
+  const grouping = groupingFromSearchParams(searchParams)
+  const sort = sortFromSearchParams(searchParams)
+  // The grouping and the sort ride along in the same URL, so changing a
+  // filter keeps them and a saved view can set all three at once.
+  const writeUrl = useCallback(
+    (
+      nextFilters: BoardFilters,
+      nextGrouping: BoardGrouping,
+      nextSort: BoardSort,
+      options?: { replace: boolean },
+    ) =>
+      setSearchParams((current) => {
+        const next = withSort(withGrouping(toSearchParams(nextFilters), nextGrouping), nextSort)
+        // The calendar's month (#105) is not a filter, but narrowing the
+        // calendar should not also jump it back to this month.
+        const month = current.get('month')
+        if (month) next.set('month', month)
+        return next
+      }, options),
     [setSearchParams],
+  )
+  /** Undefined leaves the arrangement as it is; a saved view brings its own. */
+  const setFilters = useCallback(
+    (next: BoardFilters, arrangement?: Arrangement) =>
+      writeUrl(next, arrangement?.grouping ?? grouping, arrangement?.sort ?? sort),
+    [writeUrl, grouping, sort],
+  )
+  const setGrouping = useCallback(
+    (next: BoardGrouping) => writeUrl(filters, next, sort),
+    [writeUrl, filters, sort],
+  )
+  const setSort = useCallback(
+    (next: BoardSort) => writeUrl(filters, grouping, next),
+    [writeUrl, filters, grouping],
   )
 
   const teamData = useTeamData(team)
+  // Other people's changes arrive as they happen (#103).
+  useTeamEvents(team?.id)
   const savedViews = useSavedViews(team?.id ?? 0)
 
   // Landing on the default view, at most once per mount.
@@ -70,7 +161,9 @@ export default function BoardPage() {
   // landed -- it only stops the redirect happening a second time, which
   // matters when somebody clears the filters and the URL goes bare again.
   const urlIsBare = searchParams.toString() === ''
-  const hasLanded = useRef(false)
+  // Coming back is not landing: a bare URL then means the filters were
+  // cleared on purpose, and the default view should not put them back.
+  const hasLanded = useRef(returning !== null)
   useEffect(() => {
     if (hasLanded.current) return
     // Arriving with filters already in the URL -- a pasted link, or a reload
@@ -86,26 +179,57 @@ export default function BoardPage() {
       (candidate) => candidate.id === savedViews.effectiveDefaultId,
     )
     if (landing) {
-      setSearchParams(toSearchParams(fromViewFilters(landing.filters)), { replace: true })
+      writeUrl(
+        fromViewFilters(landing.filters),
+        landing.group_by,
+        fromViewSort(landing.sort, landing.sort_direction),
+        { replace: true },
+      )
     }
-  }, [urlIsBare, team, savedViews, setSearchParams])
+  }, [urlIsBare, team, savedViews, writeUrl])
 
-  // Hold the issue query until the URL cannot still be rewritten from under
+  // Hold the ticket query until the URL cannot still be rewritten from under
   // it. When a team default exists this still costs one superseded request on
   // first load -- the redirect happens in the effect above, after this render
   // -- which is a fair price for not duplicating the precedence rule here.
   const filtersAreSettled = !urlIsBare || !savedViews.isLoading
 
-  const issuesParams = useMemo(() => toQueryParams(filters), [filters])
-  const issuesQuery = useListIssuesTeamsTeamIdIssuesGet(team?.id ?? 0, issuesParams, {
-    query: { enabled: Boolean(team) && filtersAreSettled },
+  // The board is in its own hand-arranged order (#88); the list in whatever
+  // the viewer sorted it by.
+  const order: BoardSort = view === 'board' ? { sort: 'rank', direction: 'asc' } : sort
+  const ticketsParams = useMemo(
+    () => ({ ...toQueryParams(filters), sort: order.sort, direction: order.direction }),
+    [filters, order.sort, order.direction],
+  )
+  const ticketsQuery = useListTicketsTeamsTeamIdTicketsGet(team?.id ?? 0, ticketsParams, {
+    query: { enabled: Boolean(team) && filtersAreSettled && projectPageId === null },
   })
-  const changeStatus = useStatusChange(team, issuesParams)
+  const changeStatus = useStatusChange(team, ticketsParams)
+  const moveTicket = useMoveTicket(team, ticketsParams)
 
   // Every filter is applied by the server now, so this page is already what
   // the board should show. Filtering it again here would only ever narrow the
   // page that was loaded, which is the bug that moved filtering server-side.
-  const issues = useMemo(() => issuesQuery.data?.items ?? [], [issuesQuery.data])
+  const tickets = useMemo(() => ticketsQuery.data?.items ?? [], [ticketsQuery.data])
+
+  const [selection, dispatchSelection] = useReducer(selectionReducer, EMPTY_SELECTION)
+  const bulk = useBulkEdit(team)
+  const { clearError } = bulk
+  const clearSelection = useCallback(() => {
+    dispatchSelection({ type: 'clear' })
+    clearError()
+  }, [clearError])
+  const selectTicket = useCallback(
+    (id: number, gesture: 'range' | 'toggle', order: readonly number[]) =>
+      dispatchSelection(gesture === 'range' ? { type: 'range', id, order } : { type: 'toggle', id }),
+    [],
+  )
+  // A selection only ever holds what is on screen. Changing a filter, or a
+  // refetch after somebody else deleted one, drops what went away -- so the
+  // bar can never act on a ticket nobody can see any more.
+  useEffect(() => {
+    dispatchSelection({ type: 'retain', visible: tickets.map((ticket) => ticket.id) })
+  }, [tickets])
 
   // Search runs on the server. The old client-side filter could only see the
   // page that was already loaded, and only matched titles.
@@ -115,14 +239,20 @@ export default function BoardPage() {
     { query: { enabled: Boolean(team) && searchQuery.length > 0 } },
   )
 
-  const openNewIssue = useCallback(() => overlays.open('newIssue'), [overlays])
+  // A guest (#104) is offered nothing that writes. The server refuses them
+  // regardless; this only keeps the board from offering what will fail.
+  const canWrite = canWriteIn(teamData.members, user?.id)
+  const openNewTicketNow = useCallback(() => overlays.open('newTicket'), [overlays])
+  const openNewTicket = canWrite ? openNewTicketNow : undefined
+  const openNewProjectNow = useCallback(() => overlays.open('newProject'), [overlays])
+  const openNewProject = canWrite ? openNewProjectNow : undefined
   const openShortcuts = useCallback(() => overlays.open('shortcuts'), [overlays])
   const togglePalette = useCallback(() => overlays.toggle('palette'), [overlays])
 
   useGlobalShortcuts({
     togglePalette,
     closeTop: overlays.closeTop,
-    openNewIssue,
+    openNewTicket,
     openShortcuts,
     suppressed: overlays.isOpen('palette') || overlays.isOpen('shortcuts'),
   })
@@ -132,13 +262,68 @@ export default function BoardPage() {
     team,
     teams,
     user,
-    openNewIssue,
+    openNewTicket,
+    openNewProject,
     openShortcuts,
   })
 
-  const openIssueFromPalette = useCallback(
-    (issue: IssueRead) => navigate(`/${team?.key}/issue/${issue.number}`),
-    [navigate, team?.key],
+  // The quick peek (#113) belongs to the board as it is: a panel opening, an
+  // overlay, another view or a search each end it. Not an overlay itself, so
+  // the overlay stack does not know about it.
+  const peek = usePeek()
+  const closePeek = peek.close
+  useEffect(() => {
+    closePeek()
+  }, [closePeek, ticketNumber, overlays.top, view, searchQuery])
+  const peekedTicket = peek.peeked
+    ? tickets.find((ticket) => ticket.id === peek.peeked?.id)
+    : undefined
+
+  // Escape clears the selection, but only once there is nothing above the
+  // board for it to close first -- the global handler closes overlays, and an
+  // open ticket panel has its own. An open peek takes its Escape first.
+  const hasSelection = selection.ids.length > 0
+  const escapeClearsSelection = hasSelection && overlays.top === null && !ticketNumber
+  useEffect(() => {
+    if (!escapeClearsSelection) return
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape' && !isTypingTarget(event.target)) clearSelection()
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [escapeClearsSelection, clearSelection])
+
+  // The open ticket, from the page already loaded when it is there -- and by
+  // its number when it is not: a ticket reached from the calendar (#105) or
+  // from search need not be among the board's first page.
+  const loadedTicket = ticketNumber
+    ? tickets.find((i) => String(i.number) === ticketNumber)
+    : undefined
+  const fetchedTicket = useGetTicketByNumberTeamsTeamIdTicketsByNumberNumberGet(
+    team?.id ?? 0,
+    Number(ticketNumber ?? 0),
+    { query: { enabled: Boolean(team && ticketNumber) && !loadedTicket } },
+  )
+
+  /**
+   * Leave the board for a ticket's page (#112) -- the command palette, search
+   * results and notifications all go there, where the board and the list
+   * open the panel instead, and the panel's own way out does too. The view
+   * and the search go onto this history entry first, so Back comes back to
+   * them; see BoardReturn.
+   */
+  const leaveForTicket = useCallback(
+    (ticket: TicketRef) => {
+      navigate(
+        { pathname: location.pathname, search: location.search },
+        {
+          replace: true,
+          state: { ...(location.state as object | null), board: { view, search } },
+        },
+      )
+      goToTicket(ticket, 'page')
+    },
+    [navigate, location, goToTicket, view, search],
   )
 
   if (isLoading) {
@@ -154,20 +339,24 @@ export default function BoardPage() {
     return <Navigate to="/new-team" replace />
   }
 
-  const openIssue = issueNumber ? issues.find((i) => String(i.number) === issueNumber) : undefined
-  const selectedCycle = teamData.cycles.find((cycle) => cycle.id === filters.cycleId) ?? null
+  const openTicket = loadedTicket ?? (ticketNumber ? fetchedTicket.data : undefined)
+  const selectedSprint = teamData.sprints.find((sprint) => sprint.id === filters.sprintId) ?? null
   const isTeamAdmin =
     teamData.members.find((member) => member.user.id === user?.id)?.role === 'admin'
-  // Nothing to save while these filters are already a view somebody named.
-  const matchesSavedView = savedViews.views.some((candidate) =>
-    sameFilters(filters, fromViewFilters(candidate.filters)),
+  // Nothing to save while this board is already a view somebody named.
+  const matchesSavedView = savedViews.views.some(
+    (candidate) =>
+      candidate.group_by === grouping &&
+      sameSort(sort, fromViewSort(candidate.sort, candidate.sort_direction)) &&
+      sameFilters(filters, fromViewFilters(candidate.filters)),
   )
 
   const sidebar = (
     <Sidebar
       filters={filters}
-      onFiltersChange={(next) => {
-        setFilters(next)
+      arrangement={{ grouping, sort }}
+      onFiltersChange={(next, arrangement) => {
+        setFilters(next, arrangement)
         setSidebarOpen(false)
       }}
       onEditView={(target) => {
@@ -176,14 +365,30 @@ export default function BoardPage() {
         overlays.open('saveView')
       }}
       isAdmin={isTeamAdmin}
-      onNewCycle={() => {
-        setSidebarOpen(false)
-        overlays.open('newCycle')
-      }}
-      onImport={() => {
-        setSidebarOpen(false)
-        overlays.open('import')
-      }}
+      onNewSprint={
+        canWrite
+          ? () => {
+              setSidebarOpen(false)
+              overlays.open('newSprint')
+            }
+          : undefined
+      }
+      onNewProject={
+        openNewProject
+          ? () => {
+              setSidebarOpen(false)
+              openNewProject()
+            }
+          : undefined
+      }
+      onImport={
+        canWrite
+          ? () => {
+              setSidebarOpen(false)
+              overlays.open('import')
+            }
+          : undefined
+      }
     />
   )
 
@@ -206,68 +411,112 @@ export default function BoardPage() {
           </div>
         )}
 
-        <div className="flex min-w-0 flex-1 flex-col gap-3">
-          <TopBar
-            view={view}
-            onViewChange={setView}
-            onNewIssue={openNewIssue}
-            onOpenSidebar={() => setSidebarOpen(true)}
-            search={search}
-            onSearchChange={setSearch}
-            filters={filters}
-            onFiltersChange={setFilters}
-            onSaveView={() => {
-              setEditingView(null)
-              overlays.open('saveView')
-            }}
-            canSaveView={!matchesSavedView}
-            notificationsOpen={overlays.isOpen('notifications')}
-            onToggleNotifications={() => overlays.toggle('notifications')}
-            onCloseNotifications={() => overlays.close('notifications')}
-          />
-          {selectedCycle && !searchQuery && <CycleBanner cycle={selectedCycle} />}
-          <div className="min-h-0 flex-1">
-            {searchQuery ? (
-              <SearchResults
-                query={searchQuery}
-                hits={searchResults.data?.items ?? []}
-                total={searchResults.data?.total ?? 0}
-                isLoading={searchResults.isLoading}
-              />
-            ) : !filtersAreSettled || issuesQuery.isLoading ? (
-              <Loading label="Loading issues…" />
-            ) : view === 'reports' ? (
-              <ReportsView />
-            ) : view === 'board' ? (
-              <KanbanBoard
-                issues={issues}
-                onStatusChange={changeStatus}
-                estimates={teamData.estimates}
-              />
-            ) : (
-              <IssueListView issues={issues} />
-            )}
+        {projectPageId !== null ? (
+          <div className="min-w-0 flex-1">
+            <ProjectPage key={projectPageId} projectId={projectPageId} />
           </div>
-        </div>
+        ) : (
+          <div className="flex min-w-0 flex-1 flex-col gap-3">
+            <TopBar
+              view={view}
+              onViewChange={setView}
+              grouping={grouping}
+              onGroupingChange={setGrouping}
+              sort={sort}
+              onSortChange={setSort}
+              onNewTicket={openNewTicket}
+              onOpenSidebar={() => setSidebarOpen(true)}
+              search={search}
+              onSearchChange={setSearch}
+              filters={filters}
+              onFiltersChange={setFilters}
+              onSaveView={() => {
+                setEditingView(null)
+                overlays.open('saveView')
+              }}
+              canSaveView={canWrite && !matchesSavedView}
+              notificationsOpen={overlays.isOpen('notifications')}
+              onToggleNotifications={() => overlays.toggle('notifications')}
+              onCloseNotifications={() => overlays.close('notifications')}
+              onOpenNotifiedTicket={leaveForTicket}
+            />
+            {selectedSprint && !searchQuery && <SprintBanner sprint={selectedSprint} />}
+            <PeekContext.Provider value={peek}>
+              <div className="min-h-0 flex-1">
+                {searchQuery ? (
+                  <SearchResults
+                    query={searchQuery}
+                    hits={searchResults.data?.items ?? []}
+                    total={searchResults.data?.total ?? 0}
+                    isLoading={searchResults.isLoading}
+                    onOpen={leaveForTicket}
+                  />
+                ) : !filtersAreSettled || ticketsQuery.isLoading ? (
+                  <Loading label={t('page.loadingTickets')} />
+                ) : view === 'calendar' ? (
+                  <CalendarView params={toQueryParams(filters)} canWrite={canWrite} />
+                ) : view === 'roadmap' ? (
+                  <RoadmapView />
+                ) : view === 'reports' ? (
+                  <ReportsView />
+                ) : view === 'board' ? (
+                  <KanbanBoard
+                    tickets={tickets}
+                    grouping={grouping}
+                    onStatusChange={changeStatus}
+                    onMove={moveTicket}
+                    onProjectChange={(ids, projectId) => bulk.update(ids, { project_id: projectId })}
+                    estimates={teamData.estimates}
+                    selectedIds={selection.ids}
+                    onSelect={canWrite ? selectTicket : undefined}
+                    onBulkStatusChange={(ids, status) => bulk.update(ids, { status_id: status.id })}
+                  />
+                ) : (
+                  <TicketListView
+                    tickets={tickets}
+                    grouping={grouping}
+                    selectedIds={selection.ids}
+                    onSelect={canWrite ? selectTicket : undefined}
+                  />
+                )}
+              </div>
+            </PeekContext.Provider>
+          </div>
+        )}
       </div>
 
+      {hasSelection &&
+        !searchQuery &&
+        (view === 'board' || view === 'list') &&
+        projectPageId === null && (
+        <BulkActionBar selectedIds={selection.ids} bulk={bulk} onClear={clearSelection} />
+      )}
       {overlays.isOpen('palette') && (
         <CommandPalette
           onClose={() => overlays.close('palette')}
           commands={commands}
-          issues={issues}
-          onOpenIssue={openIssueFromPalette}
+          tickets={tickets}
+          onOpenTicket={leaveForTicket}
         />
       )}
       {overlays.isOpen('shortcuts') && (
         <ShortcutsCheatsheet onClose={() => overlays.close('shortcuts')} />
       )}
-      {overlays.isOpen('newIssue') && <NewIssueModal onClose={() => overlays.close('newIssue')} />}
-      {overlays.isOpen('newCycle') && <NewCycleModal onClose={() => overlays.close('newCycle')} />}
+      {overlays.isOpen('newTicket') && <NewTicketModal onClose={() => overlays.close('newTicket')} />}
+      {overlays.isOpen('newSprint') && <NewSprintModal onClose={() => overlays.close('newSprint')} />}
+      {overlays.isOpen('newProject') && (
+        <NewProjectModal onClose={() => overlays.close('newProject')} />
+      )}
       {overlays.isOpen('import') && <ImportJiraModal onClose={() => overlays.close('import')} />}
       {overlays.isOpen('saveView') && (
         <SaveViewModal
           filters={editingView ? fromViewFilters(editingView.filters) : filters}
+          grouping={editingView ? editingView.group_by : grouping}
+          sort={
+            editingView
+              ? fromViewSort(editingView.sort, editingView.sort_direction)
+              : sort
+          }
           editing={editingView ?? undefined}
           onClose={() => {
             overlays.close('saveView')
@@ -275,8 +524,14 @@ export default function BoardPage() {
           }}
         />
       )}
-      {issueNumber && openIssue && (
-        <IssueDetailPanel issueId={openIssue.id} onClose={() => navigate(`/${team.key}`)} />
+      <TicketPeekLayer peek={peek} ticket={peekedTicket} onPromote={leaveForTicket} />
+      {ticketNumber && openTicket && (
+        <TicketDetailPanel
+          ticketId={openTicket.id}
+          onClose={() => navigate(`/${team.key}`)}
+          // Back from the page is the panel again, over the same view.
+          onOpenAsPage={() => leaveForTicket(openTicket)}
+        />
       )}
     </TeamProvider>
   )

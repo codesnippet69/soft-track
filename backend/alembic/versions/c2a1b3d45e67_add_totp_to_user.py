@@ -1,13 +1,13 @@
 """add TOTP two-factor authentication columns to user
 
 Revision ID: c2a1b3d45e67
-Revises: f4257f8963c4
+Revises: 24d062e0431b
 Create Date: 2026-09-10
 
-Three nullable columns on `user` for TOTP enrolment state. All three default
-to NULL / False so the ALTER succeeds on a live database with rows, and every
-existing user is treated as having 2FA off -- which is exactly the correct
-starting state for an upgrade.
+Five columns on `user` for two-factor state. Four are nullable and
+`totp_enabled` is backfilled to false, so the ALTER succeeds on a live database
+with rows and every existing user starts with two-factor off -- exactly the
+right state for an upgrade.
 """
 
 from typing import Sequence, Union
@@ -17,15 +17,15 @@ import sqlalchemy as sa
 import sqlmodel  # noqa: F401 -- autogenerate emits sqlmodel.sql.sqltypes.AutoString()
 
 revision: str = "c2a1b3d45e67"
-down_revision: Union[str, Sequence[str], None] = "f4257f8963c4"
+down_revision: Union[str, Sequence[str], None] = "24d062e0431b"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
     with op.batch_alter_table("user", schema=None) as batch_op:
-        # The TOTP secret is Base32; nullable because it is only written at
-        # enrolment-start, and only kept if the user confirms a valid code.
+        # The TOTP secret, encrypted with a key derived from SECRET_KEY. Only
+        # written once a setup is confirmed with a valid code.
         batch_op.add_column(
             sa.Column(
                 "totp_secret",
@@ -43,6 +43,7 @@ def upgrade() -> None:
                 server_default=sa.false(),
             )
         )
+        # A setup in progress: its secret, encrypted the same way.
         batch_op.add_column(
             sa.Column(
                 "totp_pending_secret",
@@ -50,7 +51,7 @@ def upgrade() -> None:
                 nullable=True,
             )
         )
-        # JSON-encoded list of SHA-256-hashed single-use recovery codes.
+        # JSON list of HMAC-SHA256 digests of the unused recovery codes.
         batch_op.add_column(
             sa.Column(
                 "totp_recovery_codes",
@@ -58,7 +59,7 @@ def upgrade() -> None:
                 nullable=True,
             )
         )
-        # Time-step of last verified TOTP to prevent replay attacks.
+        # The time step of the last accepted code, so it cannot be accepted again.
         batch_op.add_column(
             sa.Column(
                 "totp_last_step",

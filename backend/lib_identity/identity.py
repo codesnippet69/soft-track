@@ -5,13 +5,13 @@ import re
 import secrets
 from functools import lru_cache
 
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordBearer
 from sqlmodel import Session, func, select
 
+from lib_identity import api_tokens
 from lib_identity.models.identity import (
     Token,
-    TotpDisable,
     TotpEnrolmentResult,
     TotpEnrolmentStart,
     TotpLoginPending,
@@ -19,6 +19,7 @@ from lib_identity.models.identity import (
     UserUpdate,
 )
 from lib_identity.totp import (
+    TotpSecretUnreadable,
     check_recovery_code,
     decode_recovery_codes,
     decrypt_secret,
@@ -27,7 +28,6 @@ from lib_identity.totp import (
     generate_recovery_codes,
     generate_secret,
     provisioning_uri,
-    verify_code,
     verify_code_with_step,
 )
 from lib_identity.usernames import (
@@ -36,14 +36,17 @@ from lib_identity.usernames import (
     normalise_username,
 )
 from lib_softtrack.tables import User, utcnow
-from lib_utils.password import hash_password, verify_password
+from lib_utils.password import hash_password, is_usable_password, verify_password
+from lib_utils.rate_limit import address_of, api_token_by_address
 from lib_utils.token import (
     create_access_token,
     create_totp_pending_token,
     decode_access_token,
     decode_totp_pending_token,
+    is_access_token,
 )
 from web import get_session, settings
+from lib_utils.errors import ErrorCode, api_error
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 
@@ -85,21 +88,44 @@ def find_user_by_email(session: Session, email: str) -> User | None:
 
 
 def get_current_user(
+    request: Request,
     token: str = Depends(oauth2_scheme),
     session: Session = Depends(get_session),
 ) -> User:
-    """FastAPI dependency resolving the bearer token to a User row."""
-    credentials_exception = HTTPException(
+    """FastAPI dependency resolving the bearer token to a User row.
+
+    The bearer is either a session JWT or a personal API token (#90), told
+    apart by the token's `softtrack_` prefix.
+    """
+    credentials_exception = api_error(
         status_code=status.HTTP_401_UNAUTHORIZED,
+        code=ErrorCode.not_authenticated,
         detail="Could not validate credentials",
         headers={"WWW-Authenticate": "Bearer"},
     )
+    if api_tokens.is_api_token(token):
+        # Failures are throttled like sign-in failures: a token is a
+        # credential, and guessing one should cost what guessing a password
+        # does. Good tokens are never counted, so a busy script is never slowed.
+        address = address_of(request)
+        api_token_by_address.raise_if_locked(address)
+        user = api_tokens.authenticate(session, token)
+        if user is None:
+            api_token_by_address.record_attempt(address)
+            raise credentials_exception
+        request.state.via_api_token = True
+        return user
+
     payload = decode_access_token(token)
     if payload is None or payload.get("sub") is None:
         raise credentials_exception
-    # A totp_pending token carries scope="totp_pending" and must never be
-    # accepted as a real session bearer.
-    if payload.get("scope") == "totp_pending":
+    # Signed by this instance is not the same as "is a session". The OAuth
+    # exchange ticket travels in a URL fragment and is deliberately worth
+    # nothing on its own; without this check its shape -- a subject and a
+    # version -- would make it a bearer token for the two minutes it lives.
+    # The same goes for the half-finished sign-in of a two-factor account,
+    # which has passed the password but not yet the code.
+    if not is_access_token(payload):
         raise credentials_exception
     user = session.get(User, int(payload["sub"]))
     if user is None or not user.is_active:
@@ -112,13 +138,60 @@ def get_current_user(
     return user
 
 
-def _issue_token(user: User) -> Token:
+def ticket_token(user: User) -> Token:
+    """A signed-in session for `user`: the bearer token plus their own record.
+
+    Public because signing in with Google or GitHub ends the same way an
+    email and password sign-in does -- see `lib_identity/oauth.py`.
+    """
     return Token(
         access_token=create_access_token(
             subject=str(user.id), version=user.token_version
         ),
         user=UserMe.model_validate(user),
     )
+
+
+def create_user(
+    session: Session,
+    *,
+    email: str,
+    full_name: str,
+    hashed_password: str,
+    username: str | None = None,
+) -> User:
+    """The row every new account starts as, however it was created.
+
+    Shared by `/auth/register` and by a first sign-in with Google or GitHub,
+    so the two cannot drift on the parts that are not about credentials: the
+    handle, the avatar colour, and who ends up owning a fresh instance.
+    """
+    if username is not None:
+        handle = normalise_username(username)
+        assert_username_free(session, handle)
+    else:
+        handle = derive_username(session, email)
+
+    # The first account to exist owns the instance. Nobody else can grant it,
+    # so it has to be automatic or a fresh install has no administrator.
+    is_first = session.exec(select(func.count()).select_from(User)).one() == 0
+
+    user = User(
+        email=email,
+        username=handle,
+        hashed_password=hashed_password,
+        full_name=full_name,
+        avatar_color=avatar_color_for(email),
+        is_site_admin=is_first,
+        # Creating an account hands out a token, so it *is* a sign-in. Leaving
+        # this null would show someone who signed up a minute ago as "never
+        # signed in" in the admin directory.
+        last_login_at=utcnow(),
+    )
+    session.add(user)
+    session.commit()
+    session.refresh(user)
+    return user
 
 
 def register_user(
@@ -133,42 +206,29 @@ def register_user(
 
     email = email.strip().lower()
     if find_user_by_email(session, email):
-        raise HTTPException(status_code=400, detail="Email already registered")
+        raise api_error(
+            status_code=400,
+            code=ErrorCode.email_taken,
+            detail="Email already registered",
+        )
 
     # On a closed instance the invitation is the credential that lets someone
     # create an account at all -- checked against the address rather than the
     # link, so a shared link cannot sign up a stranger.
     if not settings.open_registration and not find_live_invite(session, email):
-        raise HTTPException(
+        raise api_error(
             status_code=403,
+            code=ErrorCode.invite_only,
             detail="Registration on this SoftTrack is by invitation",
         )
 
-    if username is not None:
-        handle = normalise_username(username)
-        assert_username_free(session, handle)
-    else:
-        handle = derive_username(session, email)
-
-    # The first account to exist owns the instance. Nobody else can grant it,
-    # so it has to be automatic or a fresh install has no administrator.
-    is_first = session.exec(select(func.count()).select_from(User)).one() == 0
-
-    user = User(
+    user = create_user(
+        session,
         email=email,
-        username=handle,
-        hashed_password=hash_password(password),
         full_name=full_name,
-        avatar_color=avatar_color_for(email),
-        is_site_admin=is_first,
-        # Registering hands out a token, so it *is* a sign-in. Leaving this
-        # null would show someone who signed up a minute ago as "never signed
-        # in" in the admin directory.
-        last_login_at=utcnow(),
+        hashed_password=hash_password(password),
+        username=username,
     )
-    session.add(user)
-    session.commit()
-    session.refresh(user)
 
     if invite_token:
         # Best effort: a bad or expired token should not undo an account that
@@ -178,7 +238,7 @@ def register_user(
         except HTTPException:
             pass
 
-    return _issue_token(user)
+    return ticket_token(user)
 
 
 @lru_cache(maxsize=1)
@@ -196,9 +256,7 @@ def warm_password_hasher() -> None:
     _unmatchable_hash()
 
 
-def login_user(
-    session: Session, email: str, password: str
-) -> Token | TotpLoginPending:
+def login_user(session: Session, email: str, password: str) -> Token | TotpLoginPending:
     """Phase 1 of login: verify the password.
 
     Returns a full `Token` for users without 2FA, or a `TotpLoginPending` for
@@ -216,159 +274,238 @@ def login_user(
     # the wrong password. The early return was a clean timing oracle: the two
     # answers are worded identically, but one came back in microseconds, which
     # told an attacker exactly which addresses have accounts here.
-    hashed = user.hashed_password if user else _unmatchable_hash()
+    # ...and the same for an account that signs in with Google or GitHub and
+    # has no password at all. Its stored hash cannot match anything, but
+    # *saying so* without paying for bcrypt would answer "this address exists
+    # and uses a provider" in microseconds.
+    if user and is_usable_password(user.hashed_password):
+        hashed = user.hashed_password
+    else:
+        hashed = _unmatchable_hash()
     password_matches = verify_password(password, hashed)
 
     if not user or not password_matches:
-        raise HTTPException(
+        raise api_error(
             status_code=status.HTTP_401_UNAUTHORIZED,
+            code=ErrorCode.bad_credentials,
             detail="Incorrect email or password",
         )
     # After the password check, not before: answering "deactivated" to a wrong
     # password would confirm the address exists to someone guessing.
     if not user.is_active:
-        raise HTTPException(status_code=403, detail="This account has been deactivated")
+        raise api_error(
+            status_code=403,
+            code=ErrorCode.account_deactivated,
+            detail="This account has been deactivated",
+        )
 
     if user.totp_enabled:
-        return TotpLoginPending(
-            pending_token=create_totp_pending_token(user.id, user.token_version)
-        )
+        return totp_challenge(user)
 
     user.last_login_at = utcnow()
     session.add(user)
     session.commit()
     session.refresh(user)
-    return _issue_token(user)
+    return ticket_token(user)
 
 
-def verify_totp_login(
-    session: Session, pending_token: str, code: str
-) -> Token:
-    invalid = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Invalid or expired two-factor code",
+def totp_challenge(user: User) -> TotpLoginPending:
+    """The answer to a first factor that passed, for an account with 2FA on.
+
+    Shared with signing in through Google or GitHub, which is a first factor
+    too: turning two-factor on has to mean every way in asks for a code.
+
+    The pending token is deliberately not single-use. It is only ever handed
+    to someone who has just passed the first factor, and redeeming it needs a
+    code that has never been accepted before, so presenting it twice within
+    its five minutes buys nothing that signing in again would not.
+    """
+    return TotpLoginPending(
+        pending_token=create_totp_pending_token(user.id, user.token_version)
     )
 
-    decoded = decode_totp_pending_token(pending_token)
-    if decoded is None:
-        raise invalid
-    user_id, token_version = decoded
 
-    user = session.get(User, user_id)
-    if user is None or not user.is_active or not user.totp_enabled:
-        raise invalid
-    if user.token_version != token_version:
-        raise invalid
+def _profile_text(value: str | None) -> str | None:
+    """A title or location as stored: trimmed, and null rather than blank."""
+    return (value or "").strip() or None
 
-    matched_step: Optional[int] = None
+
+def _readable_secret(encrypted: str) -> str:
+    try:
+        return decrypt_secret(encrypted)
+    except TotpSecretUnreadable:
+        raise api_error(
+            status_code=409,
+            code=ErrorCode.totp_unavailable,
+            detail=(
+                "Two-factor sign-in is unavailable for this account. "
+                "Ask a site admin to reset it."
+            ),
+        )
+
+
+def _spend_second_factor(user: User, code: str) -> bool:
+    """Whether `code` is a live TOTP code or an unused recovery code.
+
+    Either way it is spent on the row: the TOTP step is recorded so the same
+    code is refused next time, wherever it is presented, and a recovery code
+    is struck off. The caller commits.
+    """
     if user.totp_secret:
-        secret = decrypt_secret(user.totp_secret)
         valid, step = verify_code_with_step(
-            secret, code, last_time_step=user.totp_last_step
+            _readable_secret(user.totp_secret),
+            code,
+            last_time_step=user.totp_last_step,
         )
         if valid:
-            matched_step = step
+            user.totp_last_step = step
+            return True
 
-    if matched_step is not None:
-        user.totp_last_step = matched_step
-    else:
-        hashed_codes = decode_recovery_codes(user.totp_recovery_codes)
-        matched, remaining = check_recovery_code(code, hashed_codes)
-        if not matched:
-            raise invalid
+    matched, remaining = check_recovery_code(
+        code, decode_recovery_codes(user.totp_recovery_codes)
+    )
+    if matched:
         user.totp_recovery_codes = encode_recovery_codes(remaining)
+    return matched
+
+
+def verify_totp_login(session: Session, pending_token: str, code: str) -> Token:
+    """Phase 2 of login: trade a pending token and a code for a session."""
+    decoded = decode_totp_pending_token(pending_token)
+    user = session.get(User, decoded[0]) if decoded else None
+    if (
+        user is None
+        or not user.is_active
+        or not user.totp_enabled
+        or user.token_version != decoded[1]
+    ):
+        raise api_error(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            code=ErrorCode.totp_session_expired,
+            detail="Your sign-in has expired. Enter your password again.",
+        )
+
+    if not _spend_second_factor(user, code):
+        raise api_error(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            code=ErrorCode.totp_code_invalid,
+            detail="Invalid or expired two-factor code",
+        )
 
     user.last_login_at = utcnow()
     session.add(user)
     session.commit()
     session.refresh(user)
-    return _issue_token(user)
+    return ticket_token(user)
 
 
-def begin_totp_enrolment_db(
-    session: Session, user: User
-) -> TotpEnrolmentStart:
+def begin_totp_enrolment(session: Session, user: User) -> TotpEnrolmentStart:
+    """Start setting up an authenticator: a fresh secret, not yet in force.
+
+    Refused while two-factor is on. Replacing a live secret without its code
+    would let a stolen session swap in its own authenticator and then turn
+    two-factor off with it -- the very check `disable_totp` exists to make.
+    Moving to a new phone is turning it off, then on again.
+    """
+    if user.totp_enabled:
+        raise api_error(
+            status_code=400,
+            code=ErrorCode.totp_already_enabled,
+            detail="Two-factor is already on. Turn it off first to set it up again.",
+        )
     secret = generate_secret()
-    # Save into pending_secret; NEVER disable active 2FA before confirm
     user.totp_pending_secret = encrypt_secret(secret)
     session.add(user)
     session.commit()
     session.refresh(user)
-    uri = provisioning_uri(secret, user.email)
-    return TotpEnrolmentStart(provisioning_uri=uri, manual_key=secret)
+    return TotpEnrolmentStart(
+        provisioning_uri=provisioning_uri(secret, user.email), manual_key=secret
+    )
 
 
 def confirm_totp_enrolment(
     session: Session, user: User, code: str
 ) -> TotpEnrolmentResult:
-    candidate_secret_enc = user.totp_pending_secret or user.totp_secret
-    if not candidate_secret_enc:
-        raise HTTPException(
+    """Put the pending secret in force once the authenticator proves it has it.
+
+    Every other session is signed out, because they were signed in without a
+    second factor; the fresh token in the result keeps this tab signed in.
+    """
+    if not user.totp_pending_secret:
+        raise api_error(
             status_code=400,
-            detail="No enrolment in progress. Call POST /auth/totp/enrol first.",
+            code=ErrorCode.totp_not_enrolling,
+            detail="No two-factor setup in progress. Start it again.",
         )
-    raw_secret = decrypt_secret(candidate_secret_enc)
-    valid, step = verify_code_with_step(raw_secret, code)
+    valid, step = verify_code_with_step(
+        _readable_secret(user.totp_pending_secret), code
+    )
     if not valid:
-        raise HTTPException(
+        raise api_error(
             status_code=400,
+            code=ErrorCode.totp_code_invalid,
             detail="Invalid code. Check your authenticator and try again.",
         )
 
     plain_codes, hashed_codes = generate_recovery_codes()
-    user.totp_secret = encrypt_secret(raw_secret)
+    user.totp_secret = user.totp_pending_secret
     user.totp_pending_secret = None
     user.totp_enabled = True
     user.totp_recovery_codes = encode_recovery_codes(hashed_codes)
-    user.totp_last_step = None
+    # The code that turned it on is spent: it cannot then sign in as well.
+    user.totp_last_step = step
     user.token_version += 1
     session.add(user)
     session.commit()
     session.refresh(user)
 
-    fresh_token = _issue_token(user)
-    return TotpEnrolmentResult(recovery_codes=plain_codes, token=fresh_token)
+    return TotpEnrolmentResult(recovery_codes=plain_codes, token=ticket_token(user))
 
 
 def disable_totp(session: Session, user: User, code: str) -> Token:
+    """Turn two-factor off, given a live code or a recovery code."""
     if not user.totp_enabled:
-        raise HTTPException(status_code=400, detail="Two-factor is not enabled.")
-
-    code_valid = False
-    if user.totp_secret:
-        secret = decrypt_secret(user.totp_secret)
-        valid, _ = verify_code_with_step(secret, code)
-        code_valid = valid
-
-    if not code_valid:
-        hashed_codes = decode_recovery_codes(user.totp_recovery_codes)
-        matched, _ = check_recovery_code(code, hashed_codes)
-        code_valid = matched
-
-    if not code_valid:
-        raise HTTPException(
+        raise api_error(
             status_code=400,
-            detail="Invalid code. Enter a code from your authenticator or a recovery code.",
+            code=ErrorCode.totp_not_enabled,
+            detail="Two-factor is not on for this account.",
+        )
+    if not _spend_second_factor(user, code):
+        raise api_error(
+            status_code=400,
+            code=ErrorCode.totp_code_invalid,
+            detail=(
+                "Invalid code. Enter a code from your authenticator "
+                "or a recovery code."
+            ),
         )
 
+    clear_totp(user)
+    user.token_version += 1
+    session.add(user)
+    session.commit()
+    session.refresh(user)
+    return ticket_token(user)
+
+
+def clear_totp(user: User) -> None:
+    """Every piece of two-factor state, gone -- a half-finished setup too."""
     user.totp_secret = None
     user.totp_pending_secret = None
     user.totp_enabled = False
     user.totp_recovery_codes = None
     user.totp_last_step = None
-    user.token_version += 1
-    session.add(user)
-    session.commit()
-    session.refresh(user)
-
-    return _issue_token(user)
 
 
 def update_profile(session: Session, user: User, payload: UserUpdate) -> User:
     if payload.full_name is not None:
         name = payload.full_name.strip()
         if not name:
-            raise HTTPException(status_code=400, detail="A name cannot be empty")
+            raise api_error(
+                status_code=400,
+                code=ErrorCode.name_required,
+                detail="A name cannot be empty",
+            )
         user.full_name = name
 
     if payload.username is not None:
@@ -376,24 +513,48 @@ def update_profile(session: Session, user: User, payload: UserUpdate) -> User:
         assert_username_free(session, handle, except_user_id=user.id)
         user.username = handle
 
+    # Null and blank both clear: the form sends whatever is in the field, and
+    # an API client can send null. Leaving the key out leaves the value alone.
+    sent = payload.model_fields_set
+    if "job_title" in sent:
+        user.job_title = _profile_text(payload.job_title)
+    if "location" in sent:
+        user.location = _profile_text(payload.location)
+
     if payload.avatar_color is not None:
         if not _HEX_COLOR.match(payload.avatar_color):
-            raise HTTPException(status_code=400, detail="A colour looks like #6366f1")
+            raise api_error(
+                status_code=400,
+                code=ErrorCode.invalid_colour,
+                detail="A colour looks like #6366f1",
+            )
         user.avatar_color = payload.avatar_color.lower()
 
     if payload.email is not None:
         email = payload.email.strip().lower()
         if email != user.email.lower():
-            if not payload.current_password or not verify_password(
-                payload.current_password, user.hashed_password
+            # An account with no password -- one created by signing in with
+            # Google or GitHub -- has nothing to re-verify against, and asking
+            # for a password it does not have would make the address the one
+            # field such an account can never change. The session is already
+            # authenticated, and anyone holding it could set a password first
+            # and then pass this check anyway.
+            if is_usable_password(user.hashed_password) and (
+                not payload.current_password
+                or not verify_password(payload.current_password, user.hashed_password)
             ):
-                raise HTTPException(
+                raise api_error(
                     status_code=400,
+                    code=ErrorCode.current_password_required,
                     detail="Enter your current password to change your email",
                 )
             existing = find_user_by_email(session, email)
             if existing and existing.id != user.id:
-                raise HTTPException(status_code=400, detail="Email already registered")
+                raise api_error(
+                    status_code=400,
+                    code=ErrorCode.email_taken,
+                    detail="Email already registered",
+                )
             user.email = email
 
     session.add(user)
@@ -402,9 +563,25 @@ def update_profile(session: Session, user: User, payload: UserUpdate) -> User:
     return user
 
 
-def change_password(session: Session, user: User, current: str, new: str) -> Token:
-    if not verify_password(current, user.hashed_password):
-        raise HTTPException(status_code=400, detail="Current password is incorrect")
+def change_password(
+    session: Session, user: User, current: str | None, new: str
+) -> Token:
+    """Change the password -- or set the first one, for an account without.
+
+    An account created by signing in with Google or GitHub has no password to
+    confirm, and refusing until it has one would be a loop. Being able to add
+    one matters beyond convenience: it is what lets somebody keep their
+    account when the operator turns a provider off, and what the email change
+    above asks for once it exists.
+    """
+    if is_usable_password(user.hashed_password) and not verify_password(
+        current or "", user.hashed_password
+    ):
+        raise api_error(
+            status_code=400,
+            code=ErrorCode.current_password_incorrect,
+            detail="Current password is incorrect",
+        )
 
     user.hashed_password = hash_password(new)
     # Every other session dies here. That is the point of changing a password
@@ -415,7 +592,7 @@ def change_password(session: Session, user: User, current: str, new: str) -> Tok
     session.refresh(user)
     # A fresh token for the tab that made the change, so the person who just
     # secured their account is not the one thrown out of it.
-    return _issue_token(user)
+    return ticket_token(user)
 
 
 def sign_out_everywhere(session: Session, user: User) -> Token:
@@ -423,7 +600,7 @@ def sign_out_everywhere(session: Session, user: User) -> Token:
     session.add(user)
     session.commit()
     session.refresh(user)
-    return _issue_token(user)
+    return ticket_token(user)
 
 
 def list_my_invites(session: Session, user: User):

@@ -19,7 +19,9 @@ const some: BoardFilters = {
   assignee: 7,
   labelId: 3,
   projectId: 2,
-  cycleId: 5,
+  sprintId: 5,
+  due: 'overdue',
+  type: 'bug',
 }
 
 describe('the URL round trip', () => {
@@ -41,7 +43,7 @@ describe('the URL round trip', () => {
   it('ignores a filter it cannot parse rather than passing it on', () => {
     // A truncated or hand-edited link should show an unfiltered board, not
     // send NaN to the API and get a 422.
-    const params = new URLSearchParams('status=abc&label=abc&project=-1&cycle=')
+    const params = new URLSearchParams('status=abc&label=abc&project=-1&sprint=')
     expect(fromSearchParams(params)).toEqual(NO_FILTERS)
   })
 
@@ -49,19 +51,43 @@ describe('the URL round trip', () => {
     const params = toSearchParams({ ...NO_FILTERS, priority: 'high' })
     expect(params.toString()).toBe('priority=high')
   })
+
+  it('still reads a link sent while sprints were called cycles (#214)', () => {
+    expect(fromSearchParams(new URLSearchParams('cycle=5'))).toEqual({
+      ...NO_FILTERS,
+      sprintId: 5,
+    })
+    // Written the new way from then on, and the new key wins over the old.
+    expect(toSearchParams({ ...NO_FILTERS, sprintId: 5 }).toString()).toBe('sprint=5')
+    expect(fromSearchParams(new URLSearchParams('sprint=6&cycle=5')).sprintId).toBe(6)
+  })
 })
 
 describe('toQueryParams', () => {
-  it('maps the board onto what the issue endpoint asks for', () => {
-    expect(toQueryParams(some)).toEqual({
+  it('maps the board onto what the ticket endpoint asks for', () => {
+    expect(toQueryParams(some, '2026-09-23')).toEqual({
       status_id: 9,
       priority: 'urgent',
       assignee_id: 7,
       unassigned: undefined,
       label_id: 3,
       project_id: 2,
-      cycle_id: 5,
+      sprint_id: 5,
+      due: 'overdue',
+      today: '2026-09-23',
+      type: 'bug',
     })
+  })
+
+  it("sends the viewer's own today with a due filter, and not without one (#87)", () => {
+    expect(toQueryParams({ ...NO_FILTERS, due: 'this_week' }, '2026-09-27').today).toBe(
+      '2026-09-27',
+    )
+    expect(toQueryParams({ ...NO_FILTERS, statusId: 4 }, '2026-09-27').today).toBeUndefined()
+  })
+
+  it('reads an unknown due value in a link as no filter', () => {
+    expect(fromSearchParams(new URLSearchParams('due=someday')).due).toBeNull()
   })
 
   it('sends unassigned as its own flag, not as an assignee', () => {
@@ -99,7 +125,7 @@ describe('the saved-view round trip', () => {
 describe('sameFilters', () => {
   it('is what lights up the saved view a link happens to match', () => {
     expect(sameFilters(some, { ...some })).toBe(true)
-    expect(sameFilters(some, { ...some, cycleId: 6 })).toBe(false)
+    expect(sameFilters(some, { ...some, sprintId: 6 })).toBe(false)
   })
 
   it('tells "unassigned" apart from a person', () => {
@@ -112,7 +138,7 @@ describe('sameFilters', () => {
 describe('activeCount', () => {
   it('counts the chips the filter bar will show', () => {
     expect(activeCount(NO_FILTERS)).toBe(0)
-    expect(activeCount(some)).toBe(6)
+    expect(activeCount(some)).toBe(8)
     expect(isEmpty(NO_FILTERS)).toBe(true)
     expect(isEmpty({ ...NO_FILTERS, statusId: 4 })).toBe(false)
   })

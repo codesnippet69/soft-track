@@ -10,28 +10,56 @@ class BurndownPoint(BaseModel):
     day: date
     #: Points still outstanding at the end of this day.
     points_remaining: int
-    issues_remaining: int
+    tickets_remaining: int
     #: Points completed so far -- the burnup line, from the same data.
     points_completed: int
-    #: Total points in the cycle on this day. It moves when scope changes,
+    #: Total points in the sprint on this day. It moves when scope changes,
     #: which is exactly what makes a burndown honest.
     points_total: int
-    #: The straight line from the cycle's opening scope to zero. Not a target
+    #: The straight line from the sprint's opening scope to zero. Not a target
     #: so much as the thing the real line is read against.
     ideal_remaining: float
 
 
+class ProjectBurnupPoint(BaseModel):
+    """What one project -- an epic -- held at the end of one day (#64)."""
+
+    day: date
+    #: Tickets in the project that day, cancelled ones left out -- the same
+    #: rule progress follows (#13): cancelled work was neither done nor owed.
+    scope_tickets: int
+    completed_tickets: int
+    #: Points across the sized tickets only. An unsized ticket is not zero,
+    #: so it is counted below instead of being summed in as one.
+    scope_points: int
+    completed_points: int
+    #: In scope that day with no estimate. Non-zero means `scope_points` is a
+    #: floor, not the size of the epic.
+    unestimated_tickets: int
+
+
+class ProjectBurnup(BaseModel):
+    project_id: int
+    project_name: str
+    #: The first day history records anything about this project, or null
+    #: when it has none yet. The chart starts here rather than at the
+    #: project's creation: before this day there is nothing to replay, and
+    #: drawing it flat would be inventing a history.
+    started_on: Optional[date] = None
+    points: list[ProjectBurnupPoint]
+
+
 class ScopeChange(BaseModel):
     day: date
-    issues_added: int
-    issues_removed: int
+    tickets_added: int
+    tickets_removed: int
     points_added: int
     points_removed: int
 
 
 class Burndown(BaseModel):
-    cycle_id: int
-    cycle_name: str
+    sprint_id: int
+    sprint_name: str
     starts_at: date
     ends_at: date
     points: list[BurndownPoint]
@@ -39,18 +67,18 @@ class Burndown(BaseModel):
     scope_changes: list[ScopeChange]
 
 
-class VelocityCycle(BaseModel):
-    cycle_id: int
-    cycle_name: str
+class VelocitySprint(BaseModel):
+    sprint_id: int
+    sprint_name: str
     completed_at: Optional[date] = None
     points_committed: int
     points_completed: int
-    issues_completed: int
+    tickets_completed: int
 
 
 class Velocity(BaseModel):
-    cycles: list[VelocityCycle]
-    #: Mean completed points across the cycles returned. Null when there are
+    sprints: list[VelocitySprint]
+    #: Mean completed points across the sprints returned. Null when there are
     #: none -- a zero would read as "this team delivers nothing".
     average_points: Optional[float] = None
 
@@ -60,7 +88,7 @@ class FlowPoint(BaseModel):
     #: Keyed by category, not by status. A chart of the past has to keep
     #: meaning something after a team renames, merges or deletes a
     #: column, and the five categories are the only vocabulary that
-    #: survives that. See IssueEvent in tables.py.
+    #: survives that. See TicketEvent in tables.py.
     counts: dict[StatusCategory, int]
 
 

@@ -4,6 +4,19 @@ from jose import JWTError, jwt
 
 from web import settings
 
+#: Stamped on every token this function signs. The instance signs other things
+#: with the same key -- the OAuth state cookie, the exchange and link tickets
+#: in `lib_identity/oauth.py` -- and each carries its own `typ`, so none of them
+#: can be presented as a session. Tokens minted before this existed carry no
+#: `typ` at all, which is why `None` is accepted too and not treated as a
+#: forgery.
+ACCESS_TOKEN_TYPE = "access"
+
+
+def is_access_token(payload: dict) -> bool:
+    """Whether these claims are a session token rather than something else."""
+    return payload.get("typ") in (None, ACCESS_TOKEN_TYPE)
+
 
 def create_access_token(
     subject: str, version: int = 0, expires_minutes: int | None = None
@@ -17,7 +30,12 @@ def create_access_token(
     expire = datetime.now(timezone.utc) + timedelta(
         minutes=expires_minutes or settings.access_token_expire_minutes
     )
-    to_encode = {"sub": subject, "exp": expire, "ver": version}
+    to_encode = {
+        "sub": subject,
+        "exp": expire,
+        "ver": version,
+        "typ": ACCESS_TOKEN_TYPE,
+    }
     return jwt.encode(to_encode, settings.secret_key, algorithm=settings.algorithm)
 
 
@@ -34,33 +52,34 @@ def decode_access_token(token: str) -> dict | None:
         return None
 
 
-_TOTP_PENDING_SCOPE = "totp_pending"
+#: The `typ` of the half-finished sign-in a TOTP account gets for its password.
+#: Anything but "access", so `is_access_token` refuses it as a session.
+TOTP_PENDING_TYPE = "totp_pending"
 _TOTP_PENDING_MINUTES = 5
 
 
 def create_totp_pending_token(user_id: int, version: int = 0) -> str:
+    """Proof that the first factor passed, redeemable only at /auth/totp/verify.
+
+    Stamped with the token version, so a password change or an admin reset
+    part-way through a sign-in voids it.
+    """
     expire = datetime.now(timezone.utc) + timedelta(minutes=_TOTP_PENDING_MINUTES)
     payload = {
         "sub": str(user_id),
         "ver": version,
-        "scope": _TOTP_PENDING_SCOPE,
+        "typ": TOTP_PENDING_TYPE,
         "exp": expire,
     }
     return jwt.encode(payload, settings.secret_key, algorithm=settings.algorithm)
 
 
 def decode_totp_pending_token(token: str) -> tuple[int, int] | None:
-    try:
-        payload = jwt.decode(
-            token, settings.secret_key, algorithms=[settings.algorithm]
-        )
-        if payload.get("scope") != _TOTP_PENDING_SCOPE:
-            return None
-        sub = payload.get("sub")
-        if sub is None:
-            return None
-        ver = payload.get("ver", 0)
-        return int(sub), int(ver)
-    except (JWTError, ValueError, TypeError):
+    """`(user_id, token_version)` from a pending token, or None."""
+    payload = decode_access_token(token)
+    if payload is None or payload.get("typ") != TOTP_PENDING_TYPE:
         return None
-
+    try:
+        return int(payload["sub"]), int(payload.get("ver", 0))
+    except (KeyError, ValueError, TypeError):
+        return None

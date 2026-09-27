@@ -1,4 +1,4 @@
-"""Saved views: named filter sets over a team's issues, and where you land.
+"""Saved views: named filter sets over a team's tickets, and where you land.
 
 Two things live here that are easy to get wrong separately and easy to keep
 straight together:
@@ -15,7 +15,6 @@ expressed; the client is told the answer rather than the rule.
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import HTTPException
 from sqlmodel import Session, or_, select
 
 from lib_identity.models.identity import UserPublic
@@ -28,7 +27,7 @@ from lib_softtrack.models.views import (
     ViewFilters,
 )
 from lib_softtrack.tables import (
-    Cycle,
+    Sprint,
     Label,
     Project,
     SavedView,
@@ -43,6 +42,7 @@ from lib_softtrack.teams import (
     require_team_admin,
     require_team_member,
 )
+from lib_utils.errors import ErrorCode, api_error
 
 
 def _to_read(view: SavedView, owner: User) -> SavedViewRead:
@@ -59,8 +59,13 @@ def _to_read(view: SavedView, owner: User) -> SavedViewRead:
             unassigned=view.unassigned,
             label_id=view.label_id,
             project_id=view.project_id,
-            cycle_id=view.cycle_id,
+            sprint_id=view.sprint_id,
+            due=view.due,
+            type=view.type,
         ),
+        group_by=view.group_by,
+        sort=view.sort,
+        sort_direction=view.sort_direction,
         created_at=view.created_at,
         updated_at=view.updated_at,
     )
@@ -73,7 +78,9 @@ def _apply_filters(view: SavedView, filters: ViewFilters) -> None:
     view.unassigned = filters.unassigned
     view.label_id = filters.label_id
     view.project_id = filters.project_id
-    view.cycle_id = filters.cycle_id
+    view.sprint_id = filters.sprint_id
+    view.due = filters.due
+    view.type = filters.type
 
 
 def _validate_filters(session: Session, team_id: int, filters: ViewFilters) -> None:
@@ -86,19 +93,35 @@ def _validate_filters(session: Session, team_id: int, filters: ViewFilters) -> N
     if filters.status_id is not None:
         status = session.get(WorkflowStatus, filters.status_id)
         if status is None or status.team_id != team_id:
-            raise HTTPException(status_code=400, detail="No such status on this team")
+            raise api_error(
+                status_code=400,
+                code=ErrorCode.not_on_this_team,
+                detail="No such status on this team",
+            )
     if filters.label_id is not None:
         label = session.get(Label, filters.label_id)
         if label is None or label.team_id != team_id:
-            raise HTTPException(status_code=400, detail="No such label on this team")
+            raise api_error(
+                status_code=400,
+                code=ErrorCode.not_on_this_team,
+                detail="No such label on this team",
+            )
     if filters.project_id is not None:
         project = session.get(Project, filters.project_id)
         if project is None or project.team_id != team_id:
-            raise HTTPException(status_code=400, detail="No such project on this team")
-    if filters.cycle_id is not None:
-        cycle = session.get(Cycle, filters.cycle_id)
-        if cycle is None or cycle.team_id != team_id:
-            raise HTTPException(status_code=400, detail="No such cycle on this team")
+            raise api_error(
+                status_code=400,
+                code=ErrorCode.not_on_this_team,
+                detail="No such project on this team",
+            )
+    if filters.sprint_id is not None:
+        sprint = session.get(Sprint, filters.sprint_id)
+        if sprint is None or sprint.team_id != team_id:
+            raise api_error(
+                status_code=400,
+                code=ErrorCode.not_on_this_team,
+                detail="No such sprint on this team",
+            )
     if filters.assignee_id is not None:
         member = session.exec(
             select(TeamMember).where(
@@ -107,8 +130,10 @@ def _validate_filters(session: Session, team_id: int, filters: ViewFilters) -> N
             )
         ).first()
         if member is None:
-            raise HTTPException(
-                status_code=400, detail="That person is not on this team"
+            raise api_error(
+                status_code=400,
+                code=ErrorCode.user_not_on_team,
+                detail="That person is not on this team",
             )
 
 
@@ -132,10 +157,14 @@ def get_view_or_404(session: Session, current_user: User, view_id: int) -> Saved
     """
     view = session.get(SavedView, view_id)
     if view is None:
-        raise HTTPException(status_code=404, detail="View not found")
+        raise api_error(
+            status_code=404, code=ErrorCode.view_not_found, detail="View not found"
+        )
     require_team_member(view.team_id, current_user, session)
     if not view.is_shared and view.owner_id != current_user.id:
-        raise HTTPException(status_code=404, detail="View not found")
+        raise api_error(
+            status_code=404, code=ErrorCode.view_not_found, detail="View not found"
+        )
     return view
 
 
@@ -205,6 +234,9 @@ def create_view(
         name=payload.name.strip(),
         owner_id=current_user.id,
         is_shared=payload.is_shared,
+        group_by=payload.group_by,
+        sort=payload.sort,
+        sort_direction=payload.sort_direction,
     )
     _apply_filters(view, payload.filters)
     session.add(view)
@@ -224,6 +256,15 @@ def update_view(
     if payload.filters is not None:
         _validate_filters(session, view.team_id, payload.filters)
         _apply_filters(view, payload.filters)
+    if payload.group_by is not None:
+        view.group_by = payload.group_by
+    # Sorting is set as a pair and may be set back to the default (null), so
+    # it follows whatever was sent rather than skipping nulls.
+    sent = payload.model_fields_set
+    if "sort" in sent:
+        view.sort = payload.sort
+    if "sort_direction" in sent:
+        view.sort_direction = payload.sort_direction
     if payload.is_shared is not None and payload.is_shared != view.is_shared:
         view.is_shared = payload.is_shared
         if not view.is_shared:
@@ -282,10 +323,15 @@ def set_team_default(
     else:
         view = get_view_or_404(session, current_user, payload.view_id)
         if view.team_id != team_id:
-            raise HTTPException(status_code=400, detail="That view is another team's")
-        if not view.is_shared:
-            raise HTTPException(
+            raise api_error(
                 status_code=400,
+                code=ErrorCode.view_other_team,
+                detail="That view is another team's",
+            )
+        if not view.is_shared:
+            raise api_error(
+                status_code=400,
+                code=ErrorCode.view_private_default,
                 detail="A private view cannot be the team default; share it first.",
             )
         team.default_view_id = view.id
@@ -306,13 +352,17 @@ def set_my_default(
 
     if payload.view_id is None:
         # Removing the override falls back to the team's default rather than
-        # to "all issues" -- "no preference" is what the row's absence means.
+        # to "all tickets" -- "no preference" is what the row's absence means.
         if existing is not None:
             session.delete(existing)
     else:
         view = get_view_or_404(session, current_user, payload.view_id)
         if view.team_id != team_id:
-            raise HTTPException(status_code=400, detail="That view is another team's")
+            raise api_error(
+                status_code=400,
+                code=ErrorCode.view_other_team,
+                detail="That view is another team's",
+            )
         if existing is None:
             session.add(
                 UserDefaultView(
@@ -327,15 +377,27 @@ def set_my_default(
     return list_views(session, current_user, team_id)
 
 
-def clear_cycle(session: Session, cycle_id: int) -> None:
-    """Drop a deleted cycle from every view that filtered on it.
+def clear_sprint(session: Session, sprint_id: int) -> None:
+    """Drop a deleted sprint from every view that filtered on it.
 
-    Called from the cycle service. A view left pointing at a cycle that no
+    Called from the sprint service. A view left pointing at a sprint that no
     longer exists matches nothing, which reads as a broken filter rather than
     an empty one.
     """
     for view in session.exec(
-        select(SavedView).where(SavedView.cycle_id == cycle_id)
+        select(SavedView).where(SavedView.sprint_id == sprint_id)
     ).all():
-        view.cycle_id = None
+        view.sprint_id = None
+        session.add(view)
+
+
+def clear_project(session: Session, project_id: int) -> None:
+    """Drop a deleted project from every view that filtered on it.
+
+    Called from the project service, for the reason `clear_sprint` gives.
+    """
+    for view in session.exec(
+        select(SavedView).where(SavedView.project_id == project_id)
+    ).all():
+        view.project_id = None
         session.add(view)
